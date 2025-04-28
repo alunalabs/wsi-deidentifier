@@ -25,9 +25,11 @@ from gemini_extract import (  # Import from gemini script
 #
 # Process a single image and save the annotated output:
 # uv run python find_identifying_boxes.py ./sample/macro_images/GR24-4430_A_HE_M_78_macro.jpg --output ./sample/macro_images_annotated/GR24-4430_A_HE_M_78_macro_annotated.jpg
+# uv run python find_identifying_boxes.py ./sample/macro_images/GP14-5551_A_HE_macro.jpg --output ./sample/macro_images_annotated/GP14-5551_A_HE_macro_annotated.jpg
 #
 # Process all JPG images in a directory and save annotated versions to another directory:
 # uv run python find_identifying_boxes.py ./sample/macro_images/*.jpg --output ./sample/macro_images_annotated/
+# uv run python find_identifying_boxes.py ./sample/macro_images/*.{jpg,png} --output ./sample/macro_images_annotated/
 #
 # Process multiple specific images and save annotated versions to a directory:
 # uv run python find_identifying_boxes.py ./sample/macro_images/img1.jpg ./sample/macro_images/img2.png --output ./sample/macro_images_annotated/
@@ -574,10 +576,20 @@ async def main():
 
     processed_count = 0
     failed_count = 0
+    tasks = []
+    semaphore = asyncio.Semaphore(10)  # Limit concurrency
+
+    async def process_with_semaphore(image_path, output_path, hide_window):
+        """Helper function to manage semaphore acquisition/release."""
+        async with semaphore:
+            return await process_image(image_path, output_path, hide_window)
 
     # --- Process each image file ---
+    print(
+        f"Starting concurrent processing of {len(image_files)} images (max 10 at a time)..."
+    )
     for i, image_path in enumerate(image_files):
-        print(f"\nProcessing image {i + 1}/{len(image_files)}: {image_path}")
+        # print(f"Processing image {i + 1}/{len(image_files)}: {image_path}") # Moved inside process_image
 
         output_path = None
         if args.output:
@@ -594,12 +606,23 @@ async def main():
                 # Use the specific output path provided (only for single input)
                 output_path = args.output
 
-        # Call the processing function
-        success = await process_image(image_path, output_path, args.hide_window)
+        # Create a task for each image
+        task = asyncio.create_task(
+            process_with_semaphore(image_path, output_path, args.hide_window)
+        )
+        tasks.append(task)
 
-        if success:
+    # --- Wait for all tasks to complete and gather results ---
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    # --- Count successes and failures ---
+    for result in results:
+        if isinstance(result, Exception):
+            print(f"An error occurred during processing: {result}", file=sys.stderr)
+            failed_count += 1
+        elif result is True:  # process_image returns True on success
             processed_count += 1
-        else:
+        else:  # process_image returned False or something unexpected
             failed_count += 1
 
     # --- Summary ---
