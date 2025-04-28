@@ -9,6 +9,7 @@ import sys
 from pathlib import Path
 
 import tiffparser
+from replace_macro import replace_macro
 
 
 ###############################################################################
@@ -141,8 +142,10 @@ def process_slide(src: Path, out_dir: Path, salt: str, writer) -> None:
     shutil.copyfile(src, dst)
 
     delete_associated_image(dst, "label")
-    # delete_associated_image(dst, "macro")
     strip_metadata(dst)
+
+    # delete_associated_image(dst, "macro")
+    replace_macro(dst, dst)
 
     writer.writerow(
         {
