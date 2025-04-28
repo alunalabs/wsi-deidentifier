@@ -125,13 +125,40 @@ def strip_metadata(path: Path) -> None:
 
 
 ###############################################################################
+# Helper Functions (including new one)
+###############################################################################
+def check_macro_exists(file_path: Path, macro_description: str) -> bool:
+    """Checks if a macro image with the given description exists in the TIFF file."""
+    try:
+        with file_path.open("rb") as fp:
+            t = tiffparser.TiffFile(fp)
+            for page in t.pages:
+                desc_tag = page.tags.get("ImageDescription")
+                if desc_tag:
+                    desc = desc_tag.value
+                    if isinstance(desc, bytes):
+                        desc = desc.decode(errors="ignore")
+                    if macro_description.lower() in desc.lower():
+                        return True
+    except Exception as e:
+        print(
+            f"  Warning: Could not check for macro in {file_path}: {e}", file=sys.stderr
+        )
+        # If we can't check, assume it doesn't exist or is inaccessible
+        return False
+    return False
+
+
+###############################################################################
 # CLI
 ###############################################################################
 def hash_id(slide_id: str, salt: str) -> str:
     return hashlib.sha256((salt + slide_id).encode()).hexdigest()
 
 
-def process_slide(src: Path, out_dir: Path, salt: str, writer) -> None:
+def process_slide(
+    src: Path, out_dir: Path, salt: str, writer, macro_description: str
+) -> None:
     if src.suffix.lower() not in [".svs", ".tif", ".tiff"]:
         return
     slide_id = src.stem
@@ -144,8 +171,20 @@ def process_slide(src: Path, out_dir: Path, salt: str, writer) -> None:
     delete_associated_image(dst, "label")
     strip_metadata(dst)
 
-    # delete_associated_image(dst, "macro")
-    replace_macro(dst, dst)
+    # Check if macro exists before trying to replace it
+    if check_macro_exists(dst, macro_description):
+        print(f"  Replacing macro ({macro_description}) in {dst}")
+        try:
+            replace_macro(str(dst), str(dst), macro_description=macro_description)
+        except Exception as e:
+            print(
+                f"  Error replacing macro in {dst}: {e}",
+                file=sys.stderr,
+            )
+    else:
+        print(
+            f"  Macro ({macro_description}) not found or inaccessible in {dst}, skipping replacement."
+        )
 
     writer.writerow(
         {
@@ -167,6 +206,11 @@ def main(argv=None):
     p.add_argument("-o", "--out", default="deidentified", help="output directory")
     p.add_argument("--salt", required=True, help="secret salt")
     p.add_argument("-m", "--map", default="hash_mapping.csv", help="mapping CSV")
+    p.add_argument(
+        "--macro-description",
+        default="macro",
+        help="String identifier for the macro image (default: 'macro'). Case-insensitive.",
+    )
     args = p.parse_args(argv)
 
     out_dir = Path(args.out)
@@ -207,7 +251,7 @@ def main(argv=None):
         for path in sorted(list(all_paths)):  # Process in sorted order
             print(f"Processing path: {path}")
             try:
-                process_slide(path, out_dir, args.salt, writer)
+                process_slide(path, out_dir, args.salt, writer, args.macro_description)
                 print(f"✓ {path} → {out_dir}")
             except Exception as e:
                 print(f"✗ {path}: {e}", file=sys.stderr)

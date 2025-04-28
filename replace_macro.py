@@ -148,7 +148,9 @@ def fail(msg, **ctx):
     sys.exit(msg)
 
 
-def replace_macro(input_path, output_path, rect_coords=None, verbose=False):
+def replace_macro(
+    input_path, output_path, rect_coords=None, verbose=False, macro_description="macro"
+):
     """
     Replaces the macro image in an SVS file.
 
@@ -158,6 +160,7 @@ def replace_macro(input_path, output_path, rect_coords=None, verbose=False):
         rect_coords (tuple, optional): Coordinates (x0, y0, x1, y1) for the redaction rectangle.
                                      Defaults to a centered rectangle if None.
         verbose (bool): Enable verbose logging.
+        macro_description (str): The string expected in the ImageDescription tag for the macro.
     """
     logging.basicConfig(
         level=logging.DEBUG if verbose else logging.INFO,
@@ -177,14 +180,21 @@ def replace_macro(input_path, output_path, rect_coords=None, verbose=False):
         fail("Not a TIFF/SVS – bad byte order or missing magic number")
 
     ifd_off, macro = struct.unpack(endian + "I", data[4:8])[0], None
+    found_macro_ifd = False
     while ifd_off:
         ent, nxt = read_ifd(data, ifd_off, endian)
-        if "macro" in ascii_val(ent, TAG_IMAGE_DESCRIPTION, data, endian).lower():
+        desc = ascii_val(ent, TAG_IMAGE_DESCRIPTION, data, endian).lower()
+        if macro_description.lower() in desc:
             macro = ent
+            found_macro_ifd = True
             break
         ifd_off = nxt
-    if not macro:
-        fail("Macro image not found – no IFD with 'macro' in ImageDescription")
+    if not found_macro_ifd:
+        logging.info(
+            "Macro image not found (description '%s') - skipping replacement.",
+            macro_description,
+        )
+        return
 
     w = int_val(macro, TAG_IMAGE_WIDTH, data, endian)
     h = int_val(macro, TAG_IMAGE_LENGTH, data, endian)
@@ -276,6 +286,11 @@ if __name__ == "__main__":
     parser.add_argument(
         "-v", "--verbose", action="store_true", help="Enable debug-level logging."
     )
+    parser.add_argument(
+        "--macro-description",
+        default="macro",
+        help="String identifier for the macro image in ImageDescription tag (default: 'macro'). Case-insensitive.",
+    )
 
     parsed_args = parser.parse_args()
 
@@ -283,6 +298,7 @@ if __name__ == "__main__":
     out_path = parsed_args.output_svs
     rect_coords = tuple(parsed_args.rect) if parsed_args.rect else None
     verbosity = parsed_args.verbose
+    macro_desc = parsed_args.macro_description
 
     if out_path is None:
         input_dir = os.path.dirname(inp_path)
@@ -294,4 +310,4 @@ if __name__ == "__main__":
     if rect_coords and len(rect_coords) != 4:
         parser.error("Rectangle requires 4 integer coordinates: x0 y0 x1 y1.")
 
-    replace_macro(inp_path, out_path, rect_coords, verbosity)
+    replace_macro(inp_path, out_path, rect_coords, verbosity, macro_desc)
