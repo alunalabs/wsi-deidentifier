@@ -148,7 +148,7 @@ def find_text_boxes(image_path):
     return all_text_boxes  # Only return the list of upright bounding boxes
 
 
-def draw_boxes(image, barcode_boxes, text_boxes):
+def draw_boxes(image, barcode_boxes, text_boxes, encompassing_box=None):
     """Draws bounding boxes on the image."""
     output_image = image.copy()
     # Draw Barcode boxes (Green) - Now uses type
@@ -171,6 +171,12 @@ def draw_boxes(image, barcode_boxes, text_boxes):
         cv2.rectangle(output_image, (x, y), (x + w, y + h), (0, 0, 255), 2)
         # Adding text label for text boxes can be very cluttered, uncomment if needed
         # cv2.putText(output_image, 'Text', (x, y - 10 if y > 10 else y + 10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+
+    # Draw Encompassing box (Green)
+    if encompassing_box:
+        x, y, w, h = encompassing_box
+        cv2.rectangle(output_image, (x, y), (x + w, y + h), (0, 255, 0), 3)
+
     return output_image
 
 
@@ -323,9 +329,18 @@ def main():
     if text_boxes:  # Check if text_boxes is not None/empty
         all_boxes.extend(text_boxes)
 
-    # all_boxes = [
-    #     b["rect"] for b in barcode_boxes
-    # ] + text_boxes # Extract rects for counting/drawing
+    # Calculate encompassing box
+    encompassing_box = None
+    if all_boxes:
+        min_x = min(box[0] for box in all_boxes)
+        min_y = min(box[1] for box in all_boxes)
+        max_x_w = max(box[0] + box[2] for box in all_boxes)
+        max_y_h = max(box[1] + box[3] for box in all_boxes)
+        enc_w = max_x_w - min_x
+        enc_h = max_y_h - min_y
+        encompassing_box = (min_x, min_y, enc_w, enc_h)
+        print(f"\nCalculated encompassing box: {encompassing_box}")
+
     print(f"\nTotal identifying boxes found: {len(all_boxes)}")
 
     # --- Output / Display ---
@@ -334,7 +349,7 @@ def main():
     if args.output or (all_boxes and not args.hide_window):
         print("Drawing bounding boxes on image...")
         # Pass the barcode_boxes list (contains dicts) and text_boxes list to draw_boxes
-        output_image = draw_boxes(image, barcode_boxes, text_boxes)
+        output_image = draw_boxes(image, barcode_boxes, text_boxes, encompassing_box)
         output_image_generated = True
     else:
         output_image = None  # No drawing needed
