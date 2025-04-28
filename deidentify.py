@@ -179,13 +179,38 @@ def main(argv=None):
         )
         if not mapping_exists:
             writer.writeheader()
+
+        all_paths = set()
         for pattern in args.slides:
-            for path in Path().glob(pattern):
-                try:
-                    process_slide(path, out_dir, args.salt, writer)
-                    print(f"✓ {path} → {out_dir}")
-                except Exception as e:
-                    print(f"✗ {path}: {e}", file=sys.stderr)
+            print(f"Processing pattern: {pattern}")
+            expanded_patterns = []
+            # Basic brace expansion
+            match = re.match(r"(.*)\{(.*)\}(.*)", pattern)
+            if match:
+                base, exts_str, suffix = match.groups()
+                extensions = exts_str.split(",")
+                expanded_patterns = [f"{base}{ext}{suffix}" for ext in extensions]
+                print(f"  Expanded to: {expanded_patterns}")
+            else:  # No braces or malformed, use as is
+                expanded_patterns = [pattern]
+
+            for exp_pattern in expanded_patterns:
+                for path in Path().glob(exp_pattern):
+                    all_paths.add(path)  # Collect unique paths
+
+        print(f"Found {len(all_paths)} unique files to process.")
+
+        if not all_paths:
+            print("No files found matching the provided patterns.")
+            return  # Exit early if no files found
+
+        for path in sorted(list(all_paths)):  # Process in sorted order
+            print(f"Processing path: {path}")
+            try:
+                process_slide(path, out_dir, args.salt, writer)
+                print(f"✓ {path} → {out_dir}")
+            except Exception as e:
+                print(f"✗ {path}: {e}", file=sys.stderr)
 
 
 if __name__ == "__main__":

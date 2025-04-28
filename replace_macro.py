@@ -285,8 +285,11 @@ if __name__ == "__main__":
     verbosity = parsed_args.verbose
 
     if out_path is None:
-        b, e = os.path.splitext(inp_path)
-        out_path = f"{b}_macro_covered{e}"
+        input_dir = os.path.dirname(inp_path)
+        input_basename = os.path.basename(inp_path)
+        output_dir = os.path.join(input_dir, "..", "macro_covered")
+        os.makedirs(output_dir, exist_ok=True)  # Ensure the directory exists
+        out_path = os.path.join(output_dir, input_basename)
 
     if rect_coords and len(rect_coords) != 4:
         parser.error("Rectangle requires 4 integer coordinates: x0 y0 x1 y1.")
