@@ -1,0 +1,13 @@
+[project]
+name = "wsi-deidentifier"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.10.0"
+dependencies = [
+    "openslide-bin>=4.0.0.8",
+    "openslide-python>=1.4.1",
+    "pillow>=11.2.1",
+    "tifffile>=2025.3.30",
+    "tinynumpy>=1.2.1",
+]
