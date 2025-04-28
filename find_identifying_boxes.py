@@ -1,9 +1,9 @@
 import argparse
 import sys  # Import sys for exit
+import time  # Add time import
 
 import cv2
-import pytesseract
-from PIL import Image
+import easyocr
 from pylibdmtx.pylibdmtx import decode as dmtx_decode
 from pyzbar import pyzbar
 
@@ -24,9 +24,12 @@ from pyzbar import pyzbar
 def find_barcodes(image):
     """Finds all supported barcodes (QR, DataMatrix, etc.) using pyzbar and pylibdmtx,
     and returns their bounding boxes."""
+    start_time = time.time()
     barcode_boxes = []
 
+    print("  pyzbar detection started")
     # --- Use pyzbar ---
+    pyzbar_start = time.time()
     try:
         pyzbar_barcodes = pyzbar.decode(image)
         for barcode in pyzbar_barcodes:
@@ -43,9 +46,14 @@ def find_barcodes(image):
             # print(f"  - Found {barcode_type} (pyzbar): {barcode_data} at {(x, y, w, h)}")
     except Exception as e:
         print(f"Error during pyzbar detection: {e}", file=sys.stderr)
+    pyzbar_duration = time.time() - pyzbar_start
+    print(f"  pyzbar detection took: {pyzbar_duration:.4f} seconds")
 
+    print("  pylibdmtx detection started")
     # --- Use pylibdmtx ---
+    dmtx_start = time.time()
     try:
+        raise "temp disable"
         # pylibdmtx works best with grayscale images
         gray_image = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
         dmtx_barcodes = dmtx_decode(gray_image)
@@ -74,80 +82,87 @@ def find_barcodes(image):
         )
     except Exception as e:
         print(f"Error during pylibdmtx detection: {e}", file=sys.stderr)
+    dmtx_duration = time.time() - dmtx_start
+    print(f"  pylibdmtx detection took: {dmtx_duration:.4f} seconds")
 
+    total_duration = time.time() - start_time
+    print(f"Total barcode detection took: {total_duration:.4f} seconds")
     return barcode_boxes
 
 
+# Initialize EasyOCR Reader (specify languages, e.g., English)
+# Doing this globally to load the model only once.
+# Use gpu=False if you don't have a compatible GPU or CUDA setup.
+# Consider making GPU usage configurable via argparse if needed.
+try:
+    print("Initializing EasyOCR Reader (this may download models on first run)...")
+    reader = easyocr.Reader(["en"], gpu=True)  # Use gpu=False if no CUDA/GPU
+    print("EasyOCR Reader initialized.")
+except Exception as e:
+    print(f"Error initializing EasyOCR Reader: {e}", file=sys.stderr)
+    print("Please ensure PyTorch and EasyOCR are installed correctly.", file=sys.stderr)
+    # Indicate critical failure - maybe set reader to None and check in find_text_boxes
+    reader = None
+    # sys.exit(1) # Or exit immediately
+
+
 def find_text_boxes(image_cv):
-    """Finds text regions in an image using Tesseract and returns their bounding boxes."""
-    # Convert OpenCV image (BGR) to PIL image (RGB)
-    try:
-        image_rgb = cv2.cvtColor(image_cv, cv2.COLOR_BGR2RGB)
-        pil_img = Image.fromarray(image_rgb)
-    except cv2.error as e:
-        print(f"Error converting image for Tesseract: {e}", file=sys.stderr)
-        return []
+    """Finds text regions using EasyOCR."""
+    start_time = time.time()
+    all_text_boxes = []
 
-    # Use image_to_data to get bounding box information for each word
-    # Config options:
-    # --oem 3: Use default OCR Engine mode (based on what's available/installed)
-    # --psm 3: Fully automatic page segmentation (default)
-    # You might experiment with other psm values (e.g., 6 for assuming a single uniform block of text)
-    # if default results are poor. See `tesseract --help-psm` for details.
-    custom_config = r"--oem 3 --psm 3"
+    if reader is None:
+        print(
+            "EasyOCR Reader failed to initialize. Skipping text detection.",
+            file=sys.stderr,
+        )
+        return []  # Return empty list if reader couldn't be created
+
+    # EasyOCR works directly with NumPy arrays (BGR format is fine)
+    # No need for PIL conversion or rotations
+    print("  Running EasyOCR text detection...")
     try:
-        # Request dictionary output
-        data = pytesseract.image_to_data(
-            pil_img, output_type=pytesseract.Output.DICT, config=custom_config
-        )
-    except pytesseract.TesseractNotFoundError:
-        print(
-            "\nError: Tesseract OCR is not installed or not found in your system's PATH.",
-            file=sys.stderr,
-        )
-        print(
-            "Please install Tesseract for your OS: https://github.com/tesseract-ocr/tesseract#installing-tesseract",
-            file=sys.stderr,
-        )
-        print(
-            "You may also need to set the TESSERACT_CMD environment variable or use the --tesseract-path argument.",
-            file=sys.stderr,
-        )
-        # Return None to indicate a critical error preventing text detection
-        return None
+        # detail=0 gives only bounding boxes and text
+        # detail=1 gives boxes, text, and confidence
+        # paragraph=True might help group text lines, but False gives individual word boxes
+        # Set batch_size based on your GPU memory if using GPU
+        ocr_results = reader.readtext(image_cv, detail=1, paragraph=False)
+        # Example result item: ([[x1, y1], [x2, y2], [x3, y3], [x4, y4]], 'text', confidence_score)
+
     except Exception as e:
-        print(f"An error occurred during Tesseract processing: {e}", file=sys.stderr)
-        return []  # Return empty list for non-critical errors
+        print(f"An error occurred during EasyOCR processing: {e}", file=sys.stderr)
+        return []  # Return empty on error
 
-    text_boxes = []
-    n_boxes = len(data["level"])
-    min_confidence = 60  # Minimum confidence score to consider a detected word valid
+    ocr_duration = time.time() - start_time
+    print(f"  EasyOCR detection took: {ocr_duration:.4f} seconds")
 
-    for i in range(n_boxes):
-        # Level 5 corresponds to word-level boxes in Tesseract's output
-        # Check confidence level. Note: Tesseract returns confidence as string, convert to float/int.
-        try:
-            confidence = int(float(data["conf"][i]))
-        except ValueError:
-            confidence = -1  # Handle cases where confidence is not a number
+    min_confidence = 0.2  # EasyOCR confidence threshold (adjust as needed)
 
-        if data["level"][i] == 5 and confidence > min_confidence:
-            text = data["text"][i].strip()
-            # Only include boxes with actual text content (not just whitespace)
-            if text:
-                (x, y, w, h) = (
-                    data["left"][i],
-                    data["top"][i],
-                    data["width"][i],
-                    data["height"][i],
-                )
-                # Basic filtering: ignore unreasonably small boxes
-                if w > 5 and h > 5:
-                    text_boxes.append((x, y, w, h))
-                    # Optional: print detected text and confidence
-                    # print(f"  - Text: '{text}' at {(x, y, w, h)}, Conf: {confidence}")
+    for bbox, text, confidence in ocr_results:
+        if confidence >= min_confidence:
+            # bbox is a list of 4 points: [top_left, top_right, bottom_right, bottom_left]
+            # Extract coordinates
+            top_left = tuple(map(int, bbox[0]))
+            bottom_right = tuple(map(int, bbox[2]))
 
-    return text_boxes
+            # Calculate (x, y, w, h) format
+            x = top_left[0]
+            y = top_left[1]
+            w = bottom_right[0] - top_left[0]
+            h = bottom_right[1] - top_left[1]
+
+            # Basic filtering (ensure width and height are positive)
+            if w > 0 and h > 0:
+                all_text_boxes.append((x, y, w, h))
+                # Optional: Print detected text info
+                # print(f"    - Text: '{text}' at {(x, y, w, h)}, Conf: {confidence:.4f}")
+
+    print(f"  Found {len(all_text_boxes)} text boxes meeting confidence threshold.")
+
+    total_duration = time.time() - start_time
+    print(f"Total text box finding took: {total_duration:.4f} seconds")
+    # No need for unique list conversion as rotation isn't used
+    return all_text_boxes
 
 
 def draw_boxes(image, barcode_boxes, text_boxes):
@@ -178,6 +193,7 @@ def draw_boxes(image, barcode_boxes, text_boxes):
 
 def display_image(window_name, image):
     """Displays the image in a window, resizing if necessary."""
+    start_time = time.time()
     try:
         max_display_dim = 1000  # Max width/height for the display window
         h_img, w_img = image.shape[:2]
@@ -215,9 +231,13 @@ def display_image(window_name, image):
             f"\nAn unexpected error occurred during image display: {e}", file=sys.stderr
         )
         cv2.destroyAllWindows()  # Attempt to close any windows that might have opened partially
+    duration = time.time() - start_time
+    print(f"Image display function took: {duration:.4f} seconds")
 
 
 def main():
+    total_start_time = time.time()
+
     parser = argparse.ArgumentParser(
         description="Detect QR codes and text regions in an image and output bounding boxes.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,  # Corrected syntax/ensure no corruption here
@@ -231,11 +251,6 @@ def main():
         default=None,
     )
     parser.add_argument(
-        "--tesseract-path",
-        help="Optional path to the Tesseract executable if it's not in your system PATH.",
-        default=None,
-    )
-    parser.add_argument(
         "--hide-window",
         action="store_true",
         help="Do not display the image window, even if no output path is specified.",
@@ -243,32 +258,25 @@ def main():
 
     args = parser.parse_args()
 
-    # Set Tesseract command path if provided
-    if args.tesseract_path:
-        try:
-            # Basic check if the path seems plausible (optional)
-            # import os
-            # if not os.path.exists(args.tesseract_path):
-            #     print(f"Warning: Provided Tesseract path does not exist: {args.tesseract_path}", file=sys.stderr)
-            pytesseract.pytesseract.tesseract_cmd = args.tesseract_path
-        except Exception as e:
-            print(f"Error setting Tesseract path: {e}", file=sys.stderr)
-            sys.exit(1)  # Exit if setting path fails critically
-
     # Load the image using OpenCV
+    load_start = time.time()
     image = cv2.imread(args.image_path)
+    load_duration = time.time() - load_start
     if image is None:
         print(
             f"Error: Could not load image from path: {args.image_path}", file=sys.stderr
         )
         sys.exit(1)
-
-    print(f"Processing image: {args.image_path}")
+    print(f"Processing image: {args.image_path} (Load time: {load_duration:.4f}s)")
 
     # --- Barcode Detection ---
     print("Finding barcodes (QR, DataMatrix, etc.)...")
+    barcode_start = time.time()
     barcode_boxes = find_barcodes(image)  # Use renamed function
-    print(f"Found {len(barcode_boxes)} barcode(s).")
+    barcode_duration = time.time() - barcode_start
+    print(
+        f"Found {len(barcode_boxes)} barcode(s). (Detection time: {barcode_duration:.4f}s)"
+    )
     if barcode_boxes:
         print("Barcode Details:")
         for box_info in barcode_boxes:
@@ -277,29 +285,46 @@ def main():
             )  # Print type and truncated data
 
     # --- Text Detection ---
-    print("Finding text boxes (using Tesseract OCR)...")
-    text_boxes = find_text_boxes(
-        image
-    )  # This handles TesseractNotFoundError internally
+    print("Finding text boxes (using EasyOCR)...")
+    text_start = time.time()
+    # Now returns only a list of boxes
+    text_boxes = find_text_boxes(image)
+    text_duration = time.time() - text_start
 
-    if text_boxes is None:
-        # Tesseract not found, main function should exit as text detection failed critically.
-        print("Exiting due to Tesseract setup issue.", file=sys.stderr)
+    # Simplified error check (find_text_boxes returns [] on init or processing error)
+    if not isinstance(text_boxes, list):
+        # This case shouldn't happen with current logic, but as a safeguard
+        print("An unexpected error occurred during text detection.", file=sys.stderr)
         sys.exit(1)
-    elif text_boxes:
-        print(f"Found {len(text_boxes)} potential text box(es).")
+
+    # Proceed with reporting text box findings
+    if text_boxes:
+        print(
+            f"Found {len(text_boxes)} potential text box(es). (Detection time: {text_duration:.4f}s)"
+        )
         print("Text Bounding Boxes (x, y, width, height):")
         for box in text_boxes:
             print(f"  - {box}")
     else:
-        print("Found 0 text boxes.")
+        # Adjust message slightly if it could be an empty list vs None
+        if text_boxes is not None:
+            print(f"Found 0 text boxes. (Detection time: {text_duration:.4f}s)")
+        # The None case (Tesseract error) is handled above
 
-    all_boxes = [
-        b["rect"] for b in barcode_boxes
-    ] + text_boxes  # Extract rects for counting/drawing
+    # Combine boxes for drawing/counting (only if text_boxes is a list)
+    all_boxes = []
+    if barcode_boxes:  # Check if barcode_boxes is not None/empty
+        all_boxes.extend([b["rect"] for b in barcode_boxes])
+    if text_boxes:  # Check if text_boxes is not None/empty
+        all_boxes.extend(text_boxes)
+
+    # all_boxes = [
+    #     b["rect"] for b in barcode_boxes
+    # ] + text_boxes # Extract rects for counting/drawing
     print(f"\nTotal identifying boxes found: {len(all_boxes)}")
 
     # --- Output / Display ---
+    draw_start = time.time()
     output_image_generated = False
     if args.output or (all_boxes and not args.hide_window):
         print("Drawing bounding boxes on image...")
@@ -308,7 +333,11 @@ def main():
         output_image_generated = True
     else:
         output_image = None  # No drawing needed
+    draw_duration = time.time() - draw_start
+    if output_image_generated:
+        print(f"Drawing boxes took: {draw_duration:.4f} seconds")
 
+    save_display_start = time.time()
     if args.output:
         # Save the image
         try:
@@ -334,6 +363,13 @@ def main():
         print("No barcodes or text boxes were found to display or save.")
     elif args.hide_window:
         print("Image display skipped due to --hide-window flag.")
+
+    save_display_duration = time.time() - save_display_start
+    if args.output or (output_image_generated and not args.hide_window):
+        print(f"Saving/Displaying image took: {save_display_duration:.4f} seconds")
+
+    total_duration = time.time() - total_start_time
+    print(f"\nTotal script execution time: {total_duration:.4f} seconds")
 
 
 if __name__ == "__main__":
