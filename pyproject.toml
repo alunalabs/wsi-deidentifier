@@ -6,7 +6,9 @@ readme = "README.md"
 requires-python = ">=3.10.0"
 dependencies = [
   "easyocr>=1.7.2",
+  "google>=3.0.0",
   "google-cloud-vision>=3.10.1",
+  "google-genai>=1.12.1",
   "opencv-python>=4.11.0.86",
   "openslide-bin>=4.0.0.8",
   "openslide-python>=1.4.1",
