@@ -20,4 +20,3 @@ dependencies = [
 ]
 
 [tool.uv]
-# ... existing code ...

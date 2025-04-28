@@ -3,8 +3,8 @@ import sys  # Import sys for exit
 import time  # Add time import
 
 import cv2
-import easyocr
 import numpy as np
+from paddleocr import PaddleOCR  # Add PaddleOCR import
 from pylibdmtx.pylibdmtx import decode as dmtx_decode
 from pyzbar import pyzbar
 
@@ -91,90 +91,93 @@ def find_barcodes(image):
     return barcode_boxes
 
 
-# Initialize EasyOCR Reader (specify languages, e.g., English)
+# Initialize PaddleOCR Reader (specify languages, e.g., English)
 # Doing this globally to load the model only once.
-# Use gpu=False if you don't have a compatible GPU or CUDA setup.
+# Use use_gpu=False if you don't have a compatible GPU or CUDA setup.
 # Consider making GPU usage configurable via argparse if needed.
 try:
-    print("Initializing EasyOCR Reader (this may download models on first run)...")
-    reader = easyocr.Reader(["en"], gpu=True)  # Use gpu=False if no CUDA/GPU
-    print("EasyOCR Reader initialized.")
+    print("Initializing PaddleOCR (this may download models on first run)...")
+    # use_angle_cls=True helps detect text rotation
+    # Set use_gpu=True if CUDA/GPU is available, otherwise False
+    paddle_ocr = PaddleOCR(use_angle_cls=True, lang="en", use_gpu=True, show_log=False)
+    print("PaddleOCR initialized.")
 except Exception as e:
-    print(f"Error initializing EasyOCR Reader: {e}", file=sys.stderr)
-    print("Please ensure PyTorch and EasyOCR are installed correctly.", file=sys.stderr)
-    # Indicate critical failure - maybe set reader to None and check in find_text_boxes
-    reader = None
+    print(f"Error initializing PaddleOCR: {e}", file=sys.stderr)
+    print(
+        "Please ensure PaddlePaddle and PaddleOCR are installed correctly.",
+        file=sys.stderr,
+    )
+    # Indicate critical failure
+    paddle_ocr = None
     # sys.exit(1) # Or exit immediately
 
 
 def find_text_boxes(image_cv):
-    """Finds text regions using EasyOCR."""
+    """Finds text regions using PaddleOCR."""
     start_time = time.time()
     all_text_boxes = []
+    debug_boxes_raw = []  # For debug image
 
-    if reader is None:
+    if paddle_ocr is None:
         print(
-            "EasyOCR Reader failed to initialize. Skipping text detection.",
+            "PaddleOCR failed to initialize. Skipping text detection.",
             file=sys.stderr,
         )
-        return []  # Return empty list if reader couldn't be created
+        return [], []  # Return empty lists if reader couldn't be created
 
-    # EasyOCR works directly with NumPy arrays (BGR format is fine)
-    # No need for PIL conversion or rotations
-    print("  Running EasyOCR text detection...")
+    # PaddleOCR works directly with NumPy arrays (BGR format is fine)
+    print("  Running PaddleOCR text detection...")
     try:
-        # detail=0 gives only bounding boxes and text
-        # detail=1 gives boxes, text, and confidence
-        # paragraph=True might help group text lines, but False gives individual word boxes
-        # Set batch_size based on your GPU memory if using GPU
-        ocr_results = reader.readtext(image_cv, detail=1, paragraph=False)
-        # Example result item: ([[x1, y1], [x2, y2], [x3, y3], [x4, y4]], 'text', confidence_score)
+        # The ocr method returns a list of lists, where each inner list corresponds to a detected text line.
+        # Each text line list contains: [points, (text, confidence)]
+        # points is a list of 4 points [[x1, y1], [x2, y2], [x3, y3], [x4, y4]]
+        ocr_results_raw = paddle_ocr.ocr(image_cv, cls=True)
+        # PaddleOCR nests results one level deeper than EasyOCR
+        ocr_results = (
+            ocr_results_raw[0] if ocr_results_raw and len(ocr_results_raw) > 0 else []
+        )
 
     except Exception as e:
-        print(f"An error occurred during EasyOCR processing: {e}", file=sys.stderr)
-        return []  # Return empty on error
+        print(f"An error occurred during PaddleOCR processing: {e}", file=sys.stderr)
+        return [], []  # Return empty on error
 
     ocr_duration = time.time() - start_time
-    print(f"  EasyOCR detection took: {ocr_duration:.4f} seconds")
+    print(f"  PaddleOCR detection took: {ocr_duration:.4f} seconds")
 
-    min_confidence = 0.2  # EasyOCR confidence threshold (adjust as needed)
+    min_confidence = (
+        0.5  # PaddleOCR confidence threshold (adjust as needed, tends to be higher)
+    )
 
-    debug_boxes_raw = []  # For debug image
-    for bbox, text, confidence in ocr_results:
-        if confidence >= min_confidence:
-            # bbox is a list of 4 points: [top_left, top_right, bottom_right, bottom_left]
-            # Extract coordinates for drawing and processing
-            top_left = tuple(map(int, bbox[0]))
-            top_right = tuple(map(int, bbox[1]))  # Needed for drawing polygon
-            bottom_right = tuple(map(int, bbox[2]))
-            bottom_left = tuple(map(int, bbox[3]))  # Needed for drawing polygon
+    # debug_boxes_raw = [] # For debug image # Moved up
+    if ocr_results:  # Check if results exist
+        for line in ocr_results:
+            points, (text, confidence) = line
+            if confidence >= min_confidence:
+                # points is already a list of 4 points: [[x1, y1], [x2, y2], [x3, y3], [x4, y4]]
+                # Ensure points are integers for boundingRect and drawing
+                np_points = np.array(points, dtype=np.int32)
 
-            # Calculate (x, y, w, h) format for return value
-            x = top_left[0]
-            y = top_left[1]
-            w = bottom_right[0] - top_left[0]
-            h = bottom_right[1] - top_left[1]
+                # Calculate the upright bounding box (x, y, w, h) from the points
+                x, y, w, h = cv2.boundingRect(np_points)
 
-            # Basic filtering (ensure width and height are positive)
-            if w > 0 and h > 0:
-                all_text_boxes.append((x, y, w, h))
-                # Add points for drawing polygon on debug image
-                debug_boxes_raw.append(
-                    np.array(
-                        [top_left, top_right, bottom_right, bottom_left], dtype=np.int32
-                    )
-                )
-                # Optional: Print detected text info
-                # print(f"    - Text: '{text}' at {(x, y, w, h)}, Conf: {confidence:.4f}")
+                # Basic filtering (ensure width and height are positive)
+                if w > 0 and h > 0:
+                    all_text_boxes.append((x, y, w, h))
+                    # Add points for drawing polygon on debug image
+                    debug_boxes_raw.append(np_points)
+                    # Optional: Print detected text info
+                    # print(f"    - Text: '{text}' at {(x, y, w, h)}, Conf: {confidence:.4f}")
+    else:
+        print("  PaddleOCR returned no results.")
 
-    # --- Debug: Save image with raw EasyOCR boxes ---
+    # --- Debug: Save image with raw PaddleOCR boxes ---
     if debug_boxes_raw:
         try:
             debug_img = image_cv.copy()
             # Draw raw boxes (Polygons, Blue for distinction)
             cv2.polylines(
                 debug_img,
-                debug_boxes_raw,
+                debug_boxes_raw,  # Use the stored polygons
                 isClosed=True,
                 color=(255, 0, 0),
                 thickness=2,
@@ -183,9 +186,9 @@ def find_text_boxes(image_cv):
             # for x_d, y_d, w_d, h_d in all_text_boxes:
             #     cv2.rectangle(debug_img, (x_d, y_d), (x_d + w_d, y_d + h_d), (255, 0, 0), 2)
 
-            debug_filename = "debug_easyocr_boxes.png"
+            debug_filename = "debug_paddleocr_boxes.png"  # Changed filename
             cv2.imwrite(debug_filename, debug_img)
-            print(f"    [Debug] Saved image with EasyOCR boxes to: {debug_filename}")
+            print(f"    [Debug] Saved image with PaddleOCR boxes to: {debug_filename}")
         except Exception as e:
             print(
                 f"    [Debug] Error saving debug image: {e}",
@@ -197,8 +200,8 @@ def find_text_boxes(image_cv):
 
     total_duration = time.time() - start_time
     print(f"Total text box finding took: {total_duration:.4f} seconds")
-    # No need for unique list conversion as rotation isn't used
-    return all_text_boxes
+    # Return both the list of (x,y,w,h) boxes and the raw polygon points for potential drawing
+    return all_text_boxes  # Only return the list of upright bounding boxes
 
 
 def draw_boxes(image, barcode_boxes, text_boxes):
@@ -321,10 +324,10 @@ def main():
             )  # Print type and truncated data
 
     # --- Text Detection ---
-    print("Finding text boxes (using EasyOCR)...")
+    print("Finding text boxes (using PaddleOCR)...")  # Updated print
     text_start = time.time()
     # Now returns only a list of boxes
-    text_boxes = find_text_boxes(image)
+    text_boxes = find_text_boxes(image)  # Removed debug_text_polygons return
     text_duration = time.time() - text_start
 
     # Simplified error check (find_text_boxes returns [] on init or processing error)
@@ -364,7 +367,7 @@ def main():
     output_image_generated = False
     if args.output or (all_boxes and not args.hide_window):
         print("Drawing bounding boxes on image...")
-        # Pass the barcode_boxes list (contains dicts) to draw_boxes
+        # Pass the barcode_boxes list (contains dicts) and text_boxes list to draw_boxes
         output_image = draw_boxes(image, barcode_boxes, text_boxes)
         output_image_generated = True
     else:
