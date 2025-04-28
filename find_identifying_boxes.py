@@ -1,22 +1,22 @@
 import argparse
 import glob
-import os  # For GCP auth check and path handling
-import sys  # Import sys for exit
-import time  # Add time import
+import os
+import sys
+import time
 
 import cv2
 import numpy as np
 from pylibdmtx.pylibdmtx import decode as dmtx_decode
 from pyzbar import pyzbar
 
-from gcp_textract import detect_text  # Import the function
+from gcp_textract import detect_text
+from gemini_extract_tissue import (  # Import from gemini script
+    BoundingBox,
+    gemini_extract_tissue,
+)
 
 # https://github.com/NaturalHistoryMuseum/pyzbar/issues/131
-# export DYLD_FALLBACK_LIBRARY_PATH=$(brew --prefix zbar)/lib/
-# export DYLD_FALLBACK_LIBRARY_PATH=$(brew --prefix libdmtx)/lib/
-
 # export DYLD_FALLBACK_LIBRARY_PATH=$(brew --prefix zbar)/lib/:$(brew --prefix libdmtx)/lib/
-
 
 # --- Usage Examples ---
 # Process a single image and display the result:
@@ -31,6 +31,24 @@ from gcp_textract import detect_text  # Import the function
 # Process multiple specific images and save annotated versions to a directory:
 # uv run python find_identifying_boxes.py ./sample/macro_images/img1.jpg ./sample/macro_images/img2.png --output ./sample/macro_images_annotated/
 # ---
+
+
+# --- Helper Functions ---
+
+
+def check_intersection(
+    box1: tuple[int, int, int, int], box2: tuple[int, int, int, int]
+) -> bool:
+    """Checks if two bounding boxes (x, y, w, h) intersect."""
+    x1, y1, w1, h1 = box1
+    x2, y2, w2, h2 = box2
+
+    # Check for horizontal overlap
+    overlap_x = (x1 < x2 + w2) and (x1 + w1 > x2)
+    # Check for vertical overlap
+    overlap_y = (y1 < y2 + h2) and (y1 + h1 > y2)
+
+    return overlap_x and overlap_y
 
 
 def find_barcodes(image):
@@ -157,7 +175,14 @@ def find_text_boxes(image_path):
     return all_text_boxes  # Only return the list of upright bounding boxes
 
 
-def draw_boxes(image, barcode_boxes, text_boxes, encompassing_box=None):
+def draw_boxes(
+    image,
+    barcode_boxes,
+    text_boxes,
+    tissue_boxes: list[tuple[int, int, int, int]]
+    | None = None,  # Add tissue_boxes argument
+    encompassing_box=None,
+):
     """Draws bounding boxes on the image."""
     output_image = image.copy()
     # Draw Barcode boxes (Green) - Now uses type
@@ -181,7 +206,22 @@ def draw_boxes(image, barcode_boxes, text_boxes, encompassing_box=None):
         # Adding text label for text boxes can be very cluttered, uncomment if needed
         # cv2.putText(output_image, 'Text', (x, y - 10 if y > 10 else y + 10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
 
-    # Draw Encompassing box (Green)
+    # Draw Tissue boxes (Blue)
+    if tissue_boxes:
+        for x, y, w, h in tissue_boxes:
+            cv2.rectangle(output_image, (x, y), (x + w, y + h), (255, 0, 0), 2)
+            # Add label if needed, similar to text/barcode boxes
+            cv2.putText(
+                output_image,
+                "Tissue",
+                (x, y - 10 if y > 10 else y + 10),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.6,
+                (255, 0, 0),
+                2,
+            )
+
+    # Draw Encompassing box (Green) - Applies only to filtered non-tissue boxes now
     if encompassing_box:
         x, y, w, h = encompassing_box
         cv2.rectangle(output_image, (x, y), (x + w, y + h), (0, 255, 0), 3)
@@ -247,6 +287,9 @@ def process_image(image_path, output_path=None, hide_window=False):
         return False  # Indicate failure
     print(f"  Image loaded. (Load time: {load_duration:.4f}s)")
 
+    # Get image dimensions once
+    img_height, img_width = image.shape[:2]
+
     # --- Barcode Detection ---
     print("  Finding barcodes (QR, DataMatrix, etc.)...")
     barcode_start = time.time()
@@ -288,33 +331,120 @@ def process_image(image_path, output_path=None, hide_window=False):
     else:
         print(f"  Found 0 text boxes via GCP. (Detection time: {text_duration:.4f}s)")
 
-    # Combine boxes for drawing/counting
-    all_boxes = []
-    if barcode_boxes:  # Check if barcode_boxes is not None/empty
-        all_boxes.extend([b["rect"] for b in barcode_boxes])
-    if text_boxes:  # Check if text_boxes is not None/empty
-        all_boxes.extend(text_boxes)
+    # --- Tissue Detection (Gemini) ---
+    print("  Finding tissue regions (using Gemini)...")
+    tissue_start = time.time()
+    tissue_boxes_rel: list[BoundingBox] = []
+    tissue_boxes_abs: list[tuple[int, int, int, int]] = []
+    try:
+        # Assuming gemini_extract_tissue handles its own auth/config via env vars or defaults
+        # Pass None for project/location initially, relying on its internal handling
+        tissue_boxes_rel = gemini_extract_tissue(
+            file_path=image_path, project_id=None, location=None
+        )
+        if tissue_boxes_rel:
+            # Convert relative coordinates to absolute pixel coordinates
+            for box in tissue_boxes_rel:
+                x_abs = int(box["x"] * img_width)
+                y_abs = int(box["y"] * img_height)
+                w_abs = int(box["width"] * img_width)
+                h_abs = int(box["height"] * img_height)
+                # Basic validation
+                if w_abs > 0 and h_abs > 0:
+                    tissue_boxes_abs.append((x_abs, y_abs, w_abs, h_abs))
+                    print(
+                        f"    - Tissue Label: {box['label']}, Rect: {(x_abs, y_abs, w_abs, h_abs)}"
+                    )  # Print absolute coords
+                else:
+                    print(
+                        f"    - Warning: Skipping invalid tissue box dimension from Gemini: {box}"
+                    )
 
-    # Calculate encompassing box
+    except Exception as e:
+        print(f"  Error during Gemini tissue detection: {e}", file=sys.stderr)
+        # Continue processing without tissue filtering if Gemini fails
+
+    tissue_duration = time.time() - tissue_start
+    print(
+        f"  Found {len(tissue_boxes_abs)} tissue region(s). (Detection time: {tissue_duration:.4f}s)"
+    )
+
+    # Combine barcode and text boxes for initial check
+    initial_all_boxes = []
+    if barcode_boxes:  # Check if barcode_boxes is not None/empty
+        initial_all_boxes.extend([b["rect"] for b in barcode_boxes])
+    if text_boxes:  # Check if text_boxes is not None/empty
+        initial_all_boxes.extend(text_boxes)
+
+    # --- Filter boxes intersecting with tissue ---
+    filtered_barcode_boxes = []  # Keep original structure for drawing labels
+    filtered_text_boxes = []
+    filtered_all_rects = []  # List of (x,y,w,h) for encompassing box calc
+
+    if tissue_boxes_abs:  # Only filter if we have tissue boxes
+        print("  Filtering boxes that intersect with tissue regions...")
+        # Filter Barcodes
+        for bc_info in barcode_boxes:
+            intersect = False
+            for tissue_box in tissue_boxes_abs:
+                if check_intersection(bc_info["rect"], tissue_box):
+                    intersect = True
+                    print(
+                        f"    - Removing barcode intersecting tissue: {bc_info['rect']}"
+                    )
+                    break
+            if not intersect:
+                filtered_barcode_boxes.append(bc_info)
+                filtered_all_rects.append(bc_info["rect"])
+
+        # Filter Text Boxes
+        for text_box in text_boxes:
+            intersect = False
+            for tissue_box in tissue_boxes_abs:
+                if check_intersection(text_box, tissue_box):
+                    intersect = True
+                    print(f"    - Removing text box intersecting tissue: {text_box}")
+                    break
+            if not intersect:
+                filtered_text_boxes.append(text_box)
+                filtered_all_rects.append(text_box)
+    else:
+        # No tissue boxes found or Gemini failed, use original lists
+        print("  Skipping tissue intersection filter (no tissue boxes found/error).")
+        filtered_barcode_boxes = barcode_boxes
+        filtered_text_boxes = text_boxes
+        filtered_all_rects = initial_all_boxes
+
+    # Calculate encompassing box using ONLY the filtered boxes
     encompassing_box = None
-    if all_boxes:
-        min_x = min(box[0] for box in all_boxes)
-        min_y = min(box[1] for box in all_boxes)
-        max_x_w = max(box[0] + box[2] for box in all_boxes)
-        max_y_h = max(box[1] + box[3] for box in all_boxes)
+    if filtered_all_rects:
+        min_x = min(box[0] for box in filtered_all_rects)
+        min_y = min(box[1] for box in filtered_all_rects)
+        max_x_w = max(box[0] + box[2] for box in filtered_all_rects)
+        max_y_h = max(box[1] + box[3] for box in filtered_all_rects)
         enc_w = max_x_w - min_x
         enc_h = max_y_h - min_y
         encompassing_box = (min_x, min_y, enc_w, enc_h)
-        print(f"  Calculated encompassing box: {encompassing_box}")
+        print(f"  Calculated encompassing box for non-tissue items: {encompassing_box}")
 
-    print(f"  Total identifying boxes found: {len(all_boxes)}")
+    print(f"  Initial identifying boxes found: {len(initial_all_boxes)}")
+    print(f"  Identifying boxes after tissue filter: {len(filtered_all_rects)}")
 
     # --- Output / Display ---
     draw_start = time.time()
     output_image_generated = False
-    if output_path or (all_boxes and not hide_window):
+    # Draw if output path specified, or if there are *any* boxes (including tissue), or if hidden
+    # Logic slightly adjusted: always draw if output path exists. Draw if not hidden and *any* box type exists.
+    if output_path or ((filtered_all_rects or tissue_boxes_abs) and not hide_window):
         print("  Drawing bounding boxes on image...")
-        output_image = draw_boxes(image, barcode_boxes, text_boxes, encompassing_box)
+        # Pass filtered barcode/text lists and the absolute tissue boxes
+        output_image = draw_boxes(
+            image,
+            filtered_barcode_boxes,
+            filtered_text_boxes,
+            tissue_boxes_abs,
+            encompassing_box,
+        )
         output_image_generated = True
         draw_duration = time.time() - draw_start
         print(f"  Drawing boxes took: {draw_duration:.4f} seconds")
@@ -347,11 +477,13 @@ def process_image(image_path, output_path=None, hide_window=False):
         # Display the image if boxes were found, no output path given, and not hidden
         print("  Displaying image with detected boxes...")
         display_image(
-            f"Detected Boxes (Barcode: Green, Text: Red) - {os.path.basename(image_path)}",
+            f"Detected Boxes (Barcode: Green, Text: Red, Tissue: Blue) - {os.path.basename(image_path)}",
             output_image,
         )
-    elif not all_boxes:
-        print("  No barcodes or text boxes were found to display or save.")
+    elif not filtered_all_rects and not tissue_boxes_abs:  # Adjusted condition
+        print(
+            "  No barcodes, text boxes, or tissue boxes were found to display or save."
+        )
     elif hide_window:
         print("  Image display skipped due to --hide-window flag.")
 

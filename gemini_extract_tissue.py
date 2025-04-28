@@ -19,7 +19,7 @@ class BoundingBox(typing.TypedDict):
     label: str
 
 
-def generate(
+def gemini_extract_tissue(
     file_path: str, project_id: str | None, location: str | None = "us-west1"
 ) -> list[BoundingBox]:
     client = genai.Client(
@@ -93,7 +93,7 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
 
-    boxes = generate(args.file_path, args.project, args.location)
+    boxes = gemini_extract_tissue(args.file_path, args.project, args.location)
     print(boxes)
     if boxes:
         img = cv2.imread(args.file_path)
