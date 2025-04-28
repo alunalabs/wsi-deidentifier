@@ -1,12 +1,14 @@
 import argparse
+import os  # For GCP auth check and path handling
 import sys  # Import sys for exit
 import time  # Add time import
 
 import cv2
 import numpy as np
-from paddleocr import PaddleOCR  # Add PaddleOCR import
 from pylibdmtx.pylibdmtx import decode as dmtx_decode
 from pyzbar import pyzbar
+
+from gcp_textract import detect_text  # Import the function
 
 # Optional: Default Tesseract path (can be overridden by command line argument)
 # On Windows, it might be: r'C:\Program Files\Tesseract-OCR\tesseract.exe'
@@ -91,112 +93,54 @@ def find_barcodes(image):
     return barcode_boxes
 
 
-# Initialize PaddleOCR Reader (specify languages, e.g., English)
-# Doing this globally to load the model only once.
-# Use use_gpu=False if you don't have a compatible GPU or CUDA setup.
-# Consider making GPU usage configurable via argparse if needed.
-try:
-    print("Initializing PaddleOCR (this may download models on first run)...")
-    # use_angle_cls=True helps detect text rotation
-    # Set use_gpu=True if CUDA/GPU is available, otherwise False
-    paddle_ocr = PaddleOCR(use_angle_cls=True, lang="en", use_gpu=True, show_log=False)
-    print("PaddleOCR initialized.")
-except Exception as e:
-    print(f"Error initializing PaddleOCR: {e}", file=sys.stderr)
-    print(
-        "Please ensure PaddlePaddle and PaddleOCR are installed correctly.",
-        file=sys.stderr,
-    )
-    # Indicate critical failure
-    paddle_ocr = None
-    # sys.exit(1) # Or exit immediately
-
-
-def find_text_boxes(image_cv):
-    """Finds text regions using PaddleOCR."""
+def find_text_boxes(image_path):
+    """Finds text regions using Google Cloud Vision API."""
     start_time = time.time()
     all_text_boxes = []
-    debug_boxes_raw = []  # For debug image
+    # debug_boxes_raw = [] # No longer needed for GCP polygons, but keep for now if we draw them
 
-    if paddle_ocr is None:
+    print(f"  Running Google Cloud Vision text detection on {image_path}...")
+    try:
+        # Call the imported detect_text function
+        gcp_texts = detect_text(image_path)
+        if not gcp_texts:
+            print("  Google Cloud Vision returned no text results.")
+            return []
+    except Exception as e:
         print(
-            "PaddleOCR failed to initialize. Skipping text detection.",
+            f"An error occurred during Google Cloud Vision processing: {e}",
             file=sys.stderr,
         )
-        return [], []  # Return empty lists if reader couldn't be created
+        return []  # Return empty list on error
 
-    # PaddleOCR works directly with NumPy arrays (BGR format is fine)
-    print("  Running PaddleOCR text detection...")
-    try:
-        # The ocr method returns a list of lists, where each inner list corresponds to a detected text line.
-        # Each text line list contains: [points, (text, confidence)]
-        # points is a list of 4 points [[x1, y1], [x2, y2], [x3, y3], [x4, y4]]
-        ocr_results_raw = paddle_ocr.ocr(image_cv, cls=True)
-        # PaddleOCR nests results one level deeper than EasyOCR
-        ocr_results = (
-            ocr_results_raw[0] if ocr_results_raw and len(ocr_results_raw) > 0 else []
-        )
+    gcp_duration = time.time() - start_time
+    print(f"  Google Cloud Vision detection took: {gcp_duration:.4f} seconds")
 
-    except Exception as e:
-        print(f"An error occurred during PaddleOCR processing: {e}", file=sys.stderr)
-        return [], []  # Return empty on error
+    # Process GCP results
+    # The first text annotation is the full text block, skip it.
+    if len(gcp_texts) > 1:
+        for text_annotation in gcp_texts[1:]:
+            vertices = text_annotation.bounding_poly.vertices
+            # Convert vertices to a NumPy array for easier calculation
+            np_points = np.array([(v.x, v.y) for v in vertices], dtype=np.int32)
 
-    ocr_duration = time.time() - start_time
-    print(f"  PaddleOCR detection took: {ocr_duration:.4f} seconds")
-
-    min_confidence = (
-        0.5  # PaddleOCR confidence threshold (adjust as needed, tends to be higher)
-    )
-
-    # debug_boxes_raw = [] # For debug image # Moved up
-    if ocr_results:  # Check if results exist
-        for line in ocr_results:
-            points, (text, confidence) = line
-            if confidence >= min_confidence:
-                # points is already a list of 4 points: [[x1, y1], [x2, y2], [x3, y3], [x4, y4]]
-                # Ensure points are integers for boundingRect and drawing
-                np_points = np.array(points, dtype=np.int32)
-
-                # Calculate the upright bounding box (x, y, w, h) from the points
+            # Calculate the upright bounding box (x, y, w, h) from the polygon vertices
+            if len(np_points) > 0:
                 x, y, w, h = cv2.boundingRect(np_points)
 
                 # Basic filtering (ensure width and height are positive)
                 if w > 0 and h > 0:
                     all_text_boxes.append((x, y, w, h))
-                    # Add points for drawing polygon on debug image
-                    debug_boxes_raw.append(np_points)
+                    # debug_boxes_raw.append(np_points) # Keep if needed for polygon drawing later
                     # Optional: Print detected text info
-                    # print(f"    - Text: '{text}' at {(x, y, w, h)}, Conf: {confidence:.4f}")
+                    # print(f"    - Text: '{text_annotation.description}' at {(x, y, w, h)}")
     else:
-        print("  PaddleOCR returned no results.")
+        print("  Google Cloud Vision returned only the full text block or nothing.")
 
-    # --- Debug: Save image with raw PaddleOCR boxes ---
-    if debug_boxes_raw:
-        try:
-            debug_img = image_cv.copy()
-            # Draw raw boxes (Polygons, Blue for distinction)
-            cv2.polylines(
-                debug_img,
-                debug_boxes_raw,  # Use the stored polygons
-                isClosed=True,
-                color=(255, 0, 0),
-                thickness=2,
-            )
-            # Alternative: Draw bounding rectangles using the calculated (x,y,w,h)
-            # for x_d, y_d, w_d, h_d in all_text_boxes:
-            #     cv2.rectangle(debug_img, (x_d, y_d), (x_d + w_d, y_d + h_d), (255, 0, 0), 2)
+    # Debug image saving logic removed as it was specific to PaddleOCR output format/needs.
+    # Could be re-added later if needed, using np_points.
 
-            debug_filename = "debug_paddleocr_boxes.png"  # Changed filename
-            cv2.imwrite(debug_filename, debug_img)
-            print(f"    [Debug] Saved image with PaddleOCR boxes to: {debug_filename}")
-        except Exception as e:
-            print(
-                f"    [Debug] Error saving debug image: {e}",
-                file=sys.stderr,
-            )
-    # --- End Debug ---
-
-    print(f"  Found {len(all_text_boxes)} text boxes meeting confidence threshold.")
+    print(f"  Found {len(all_text_boxes)} text boxes from GCP Vision.")
 
     total_duration = time.time() - start_time
     print(f"Total text box finding took: {total_duration:.4f} seconds")
@@ -297,6 +241,27 @@ def main():
 
     args = parser.parse_args()
 
+    # --- Add GCP Authentication Check ---
+    creds_env = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
+    default_creds_path = os.path.expanduser(
+        "~/.config/gcloud/application_default_credentials.json"
+    )
+    if not creds_env and not os.path.exists(default_creds_path):
+        print(
+            "Warning: Google Cloud authentication credentials not found.",
+            file=sys.stderr,
+        )
+        print(
+            "Ensure you have run 'gcloud auth application-default login' or set the GOOGLE_APPLICATION_CREDENTIALS environment variable.",
+            file=sys.stderr,
+        )
+        # sys.exit(1) # Exit if credentials are required
+    elif creds_env:
+        print(f"Using credentials from GOOGLE_APPLICATION_CREDENTIALS: {creds_env}")
+    else:
+        print(f"Using application default credentials found at: {default_creds_path}")
+    # --- End GCP Auth Check ---
+
     # Load the image using OpenCV
     load_start = time.time()
     image = cv2.imread(args.image_path)
@@ -324,31 +289,32 @@ def main():
             )  # Print type and truncated data
 
     # --- Text Detection ---
-    print("Finding text boxes (using PaddleOCR)...")  # Updated print
+    print("Finding text boxes (using Google Cloud Vision)...")  # Updated print
     text_start = time.time()
     # Now returns only a list of boxes
-    text_boxes = find_text_boxes(image)  # Removed debug_text_polygons return
+    text_boxes = find_text_boxes(args.image_path)
     text_duration = time.time() - text_start
 
     # Simplified error check (find_text_boxes returns [] on init or processing error)
     if not isinstance(text_boxes, list):
         # This case shouldn't happen with current logic, but as a safeguard
-        print("An unexpected error occurred during text detection.", file=sys.stderr)
+        print(
+            "An unexpected error occurred during GCP text detection.", file=sys.stderr
+        )
         sys.exit(1)
 
     # Proceed with reporting text box findings
     if text_boxes:
         print(
-            f"Found {len(text_boxes)} potential text box(es). (Detection time: {text_duration:.4f}s)"
+            f"Found {len(text_boxes)} potential text box(es) via GCP. (Detection time: {text_duration:.4f}s)"
         )
         print("Text Bounding Boxes (x, y, width, height):")
         for box in text_boxes:
             print(f"  - {box}")
     else:
         # Adjust message slightly if it could be an empty list vs None
-        if text_boxes is not None:
-            print(f"Found 0 text boxes. (Detection time: {text_duration:.4f}s)")
-        # The None case (Tesseract error) is handled above
+        # (find_text_boxes now always returns a list)
+        print(f"Found 0 text boxes via GCP. (Detection time: {text_duration:.4f}s)")
 
     # Combine boxes for drawing/counting (only if text_boxes is a list)
     all_boxes = []
