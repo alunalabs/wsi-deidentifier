@@ -19,7 +19,7 @@ class BoundingBox(typing.TypedDict):
     label: str
 
 
-def gemini_extract(
+async def gemini_extract(
     file_path: str,
 ) -> list[BoundingBox]:
     client = genai.Client(
@@ -54,7 +54,7 @@ def gemini_extract(
         # thinking_config=types.ThinkingConfig(thinking_budget=0),
     )
 
-    result = client.models.generate_content(
+    result = await client.aio.models.generate_content(
         model=model,
         contents=contents,
         config=generate_content_config,
@@ -93,7 +93,9 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
 
-    boxes = gemini_extract(args.file_path)
+    import asyncio
+
+    boxes = asyncio.run(gemini_extract(args.file_path))
     print(boxes)
     if boxes:
         img = cv2.imread(args.file_path)
