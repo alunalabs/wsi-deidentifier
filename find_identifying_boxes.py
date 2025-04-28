@@ -4,6 +4,7 @@ import time  # Add time import
 
 import cv2
 import easyocr
+import numpy as np
 from pylibdmtx.pylibdmtx import decode as dmtx_decode
 from pyzbar import pyzbar
 
@@ -138,14 +139,17 @@ def find_text_boxes(image_cv):
 
     min_confidence = 0.2  # EasyOCR confidence threshold (adjust as needed)
 
+    debug_boxes_raw = []  # For debug image
     for bbox, text, confidence in ocr_results:
         if confidence >= min_confidence:
             # bbox is a list of 4 points: [top_left, top_right, bottom_right, bottom_left]
-            # Extract coordinates
+            # Extract coordinates for drawing and processing
             top_left = tuple(map(int, bbox[0]))
+            top_right = tuple(map(int, bbox[1]))  # Needed for drawing polygon
             bottom_right = tuple(map(int, bbox[2]))
+            bottom_left = tuple(map(int, bbox[3]))  # Needed for drawing polygon
 
-            # Calculate (x, y, w, h) format
+            # Calculate (x, y, w, h) format for return value
             x = top_left[0]
             y = top_left[1]
             w = bottom_right[0] - top_left[0]
@@ -154,8 +158,40 @@ def find_text_boxes(image_cv):
             # Basic filtering (ensure width and height are positive)
             if w > 0 and h > 0:
                 all_text_boxes.append((x, y, w, h))
+                # Add points for drawing polygon on debug image
+                debug_boxes_raw.append(
+                    np.array(
+                        [top_left, top_right, bottom_right, bottom_left], dtype=np.int32
+                    )
+                )
                 # Optional: Print detected text info
                 # print(f"    - Text: '{text}' at {(x, y, w, h)}, Conf: {confidence:.4f}")
+
+    # --- Debug: Save image with raw EasyOCR boxes ---
+    if debug_boxes_raw:
+        try:
+            debug_img = image_cv.copy()
+            # Draw raw boxes (Polygons, Blue for distinction)
+            cv2.polylines(
+                debug_img,
+                debug_boxes_raw,
+                isClosed=True,
+                color=(255, 0, 0),
+                thickness=2,
+            )
+            # Alternative: Draw bounding rectangles using the calculated (x,y,w,h)
+            # for x_d, y_d, w_d, h_d in all_text_boxes:
+            #     cv2.rectangle(debug_img, (x_d, y_d), (x_d + w_d, y_d + h_d), (255, 0, 0), 2)
+
+            debug_filename = "debug_easyocr_boxes.png"
+            cv2.imwrite(debug_filename, debug_img)
+            print(f"    [Debug] Saved image with EasyOCR boxes to: {debug_filename}")
+        except Exception as e:
+            print(
+                f"    [Debug] Error saving debug image: {e}",
+                file=sys.stderr,
+            )
+    # --- End Debug ---
 
     print(f"  Found {len(all_text_boxes)} text boxes meeting confidence threshold.")
 
