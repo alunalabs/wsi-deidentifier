@@ -10,9 +10,9 @@ from pylibdmtx.pylibdmtx import decode as dmtx_decode
 from pyzbar import pyzbar
 
 from gcp_textract import detect_text
-from gemini_extract_tissue import (  # Import from gemini script
+from gemini_extract import (  # Import from gemini script
     BoundingBox,
-    gemini_extract_tissue,
+    gemini_extract,
 )
 
 # https://github.com/NaturalHistoryMuseum/pyzbar/issues/131
@@ -21,6 +21,7 @@ from gemini_extract_tissue import (  # Import from gemini script
 # --- Usage Examples ---
 # Process a single image and display the result:
 # uv run python find_identifying_boxes.py ./sample/macro_images/GR24-4430_A_HE_M_78_macro.jpg
+# uv run python find_identifying_boxes.py ./sample/macro_images/GP17-009358_A_HE_macro.jpg
 #
 # Process a single image and save the annotated output:
 # uv run python find_identifying_boxes.py ./sample/macro_images/GR24-4430_A_HE_M_78_macro.jpg --output ./sample/macro_images_annotated/GR24-4430_A_HE_M_78_macro_annotated.jpg
@@ -334,27 +335,38 @@ def process_image(image_path, output_path=None, hide_window=False):
     # --- Tissue Detection (Gemini) ---
     print("  Finding tissue regions (using Gemini)...")
     tissue_start = time.time()
-    tissue_boxes_rel: list[BoundingBox] = []
-    tissue_boxes_abs: list[tuple[int, int, int, int]] = []
+    gemini_response: list[BoundingBox] = []
+    gemini_tissue_boxes_abs: list[tuple[int, int, int, int]] = []
+    gemini_text_boxes_abs: list[tuple[int, int, int, int]] = []
     try:
         # Assuming gemini_extract_tissue handles its own auth/config via env vars or defaults
         # Pass None for project/location initially, relying on its internal handling
-        tissue_boxes_rel = gemini_extract_tissue(
-            file_path=image_path, project_id=None, location=None
+        gemini_response = gemini_extract(
+            file_path=image_path,
         )
-        if tissue_boxes_rel:
+        if gemini_response:
             # Convert relative coordinates to absolute pixel coordinates
-            for box in tissue_boxes_rel:
+            for box in gemini_response:
                 x_abs = int(box["x"] * img_width)
                 y_abs = int(box["y"] * img_height)
                 w_abs = int(box["width"] * img_width)
                 h_abs = int(box["height"] * img_height)
                 # Basic validation
-                if w_abs > 0 and h_abs > 0:
-                    tissue_boxes_abs.append((x_abs, y_abs, w_abs, h_abs))
+                if w_abs <= 0 or h_abs <= 0:
+                    print(
+                        f"    - Warning: Skipping invalid tissue box dimension from Gemini: {box}"
+                    )
+                    continue
+                if box["label"] == "tissue":
+                    gemini_tissue_boxes_abs.append((x_abs, y_abs, w_abs, h_abs))
                     print(
                         f"    - Tissue Label: {box['label']}, Rect: {(x_abs, y_abs, w_abs, h_abs)}"
-                    )  # Print absolute coords
+                    )
+                elif box["label"] == "text":
+                    gemini_text_boxes_abs.append((x_abs, y_abs, w_abs, h_abs))
+                    print(
+                        f"    - Text Label: {box['label']}, Rect: {(x_abs, y_abs, w_abs, h_abs)}"
+                    )
                 else:
                     print(
                         f"    - Warning: Skipping invalid tissue box dimension from Gemini: {box}"
@@ -366,7 +378,7 @@ def process_image(image_path, output_path=None, hide_window=False):
 
     tissue_duration = time.time() - tissue_start
     print(
-        f"  Found {len(tissue_boxes_abs)} tissue region(s). (Detection time: {tissue_duration:.4f}s)"
+        f"  Found {len(gemini_tissue_boxes_abs)} tissue region(s). (Detection time: {tissue_duration:.4f}s)"
     )
 
     # Combine barcode and text boxes for initial check
@@ -375,18 +387,23 @@ def process_image(image_path, output_path=None, hide_window=False):
         initial_all_boxes.extend([b["rect"] for b in barcode_boxes])
     if text_boxes:  # Check if text_boxes is not None/empty
         initial_all_boxes.extend(text_boxes)
+    if gemini_text_boxes_abs:  # Also include gemini text boxes in the initial list
+        initial_all_boxes.extend(gemini_text_boxes_abs)
+        text_boxes.extend(
+            gemini_text_boxes_abs
+        )  # Combine GCP and Gemini text boxes for filtering/drawing
 
     # --- Filter boxes intersecting with tissue ---
     filtered_barcode_boxes = []  # Keep original structure for drawing labels
     filtered_text_boxes = []
     filtered_all_rects = []  # List of (x,y,w,h) for encompassing box calc
 
-    if tissue_boxes_abs:  # Only filter if we have tissue boxes
+    if gemini_tissue_boxes_abs:  # Only filter if we have tissue boxes
         print("  Filtering boxes that intersect with tissue regions...")
         # Filter Barcodes
         for bc_info in barcode_boxes:
             intersect = False
-            for tissue_box in tissue_boxes_abs:
+            for tissue_box in gemini_tissue_boxes_abs:
                 if check_intersection(bc_info["rect"], tissue_box):
                     intersect = True
                     print(
@@ -400,7 +417,7 @@ def process_image(image_path, output_path=None, hide_window=False):
         # Filter Text Boxes
         for text_box in text_boxes:
             intersect = False
-            for tissue_box in tissue_boxes_abs:
+            for tissue_box in gemini_tissue_boxes_abs:
                 if check_intersection(text_box, tissue_box):
                     intersect = True
                     print(f"    - Removing text box intersecting tissue: {text_box}")
@@ -435,14 +452,16 @@ def process_image(image_path, output_path=None, hide_window=False):
     output_image_generated = False
     # Draw if output path specified, or if there are *any* boxes (including tissue), or if hidden
     # Logic slightly adjusted: always draw if output path exists. Draw if not hidden and *any* box type exists.
-    if output_path or ((filtered_all_rects or tissue_boxes_abs) and not hide_window):
+    if output_path or (
+        (filtered_all_rects or gemini_tissue_boxes_abs) and not hide_window
+    ):
         print("  Drawing bounding boxes on image...")
         # Pass filtered barcode/text lists and the absolute tissue boxes
         output_image = draw_boxes(
             image,
             filtered_barcode_boxes,
             filtered_text_boxes,
-            tissue_boxes_abs,
+            gemini_tissue_boxes_abs,
             encompassing_box,
         )
         output_image_generated = True
@@ -480,7 +499,7 @@ def process_image(image_path, output_path=None, hide_window=False):
             f"Detected Boxes (Barcode: Green, Text: Red, Tissue: Blue) - {os.path.basename(image_path)}",
             output_image,
         )
-    elif not filtered_all_rects and not tissue_boxes_abs:  # Adjusted condition
+    elif not filtered_all_rects and not gemini_tissue_boxes_abs:  # Adjusted condition
         print(
             "  No barcodes, text boxes, or tissue boxes were found to display or save."
         )

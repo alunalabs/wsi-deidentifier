@@ -19,8 +19,8 @@ class BoundingBox(typing.TypedDict):
     label: str
 
 
-def gemini_extract_tissue(
-    file_path: str, project_id: str | None, location: str | None = "us-west1"
+def gemini_extract(
+    file_path: str,
 ) -> list[BoundingBox]:
     client = genai.Client(
         api_key=os.getenv("GEMINI_API_KEY"),
@@ -32,8 +32,8 @@ def gemini_extract_tissue(
     files = [
         client.files.upload(file=file_path),
     ]
-    # model = "gemini-2.5-flash-preview-04-17"
-    model = "gemini-2.0-flash"
+    model = "gemini-2.5-flash-preview-04-17"
+    # model = "gemini-2.0-flash"
     contents = [
         types.Content(
             role="user",
@@ -43,7 +43,7 @@ def gemini_extract_tissue(
                     mime_type=files[0].mime_type,
                 ),
                 types.Part.from_text(
-                    text="""Detect tissue in a single item. Output a json list where each entry contains the 2D bounding box in "box_2d" and tissue in "label"."""
+                    text="""Detect text and tissue with no more than 20 items. Output a json list where each entry contains the 2D bounding box in "box_2d" and tissue/text in "label"."""
                 ),
             ],
         ),
@@ -93,7 +93,7 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
 
-    boxes = gemini_extract_tissue(args.file_path, args.project, args.location)
+    boxes = gemini_extract(args.file_path)
     print(boxes)
     if boxes:
         img = cv2.imread(args.file_path)
