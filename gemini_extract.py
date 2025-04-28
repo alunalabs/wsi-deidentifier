@@ -54,11 +54,15 @@ async def gemini_extract(
         # thinking_config=types.ThinkingConfig(thinking_budget=0),
     )
 
+    print(f"Sending request to Gemini {model}...")
+
     result = await client.aio.models.generate_content(
         model=model,
         contents=contents,
         config=generate_content_config,
     )
+
+    print(f"Received response from Gemini {model}.")
 
     if not result.text:
         print("No response from Gemini.")

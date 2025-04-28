@@ -1,4 +1,5 @@
 import argparse
+import asyncio
 import glob
 import os
 import sys
@@ -11,7 +12,6 @@ from pyzbar import pyzbar
 
 from gcp_textract import detect_text
 from gemini_extract import (  # Import from gemini script
-    BoundingBox,
     gemini_extract,
 )
 
@@ -274,7 +274,7 @@ def display_image(window_name, image):
     print(f"Image display function took: {duration:.4f} seconds")
 
 
-def process_image(image_path, output_path=None, hide_window=False):
+async def process_image(image_path, output_path=None, hide_window=False):
     """Processes a single image: loads, finds boxes, draws/saves/displays."""
     process_start_time = time.time()
     print(f"--- Processing {image_path} ---")
@@ -306,12 +306,12 @@ def process_image(image_path, output_path=None, hide_window=False):
                 f"      - Type: {box_info['type']}, Rect: {box_info['rect']}, Data: {box_info['data'][:30]}..."
             )  # Print type and truncated data
 
-    # --- Text Detection ---
-    print("  Finding text boxes (using Google Cloud Vision)...")  # Updated print
-    text_start = time.time()
-    # Now returns only a list of boxes
-    text_boxes = find_text_boxes(image_path)
-    text_duration = time.time() - text_start
+    gemini_response, text_boxes = await asyncio.gather(
+        gemini_extract(
+            file_path=image_path,
+        ),
+        asyncio.to_thread(find_text_boxes, image_path),
+    )
 
     # Simplified error check (find_text_boxes returns [] on init or processing error)
     if not isinstance(text_boxes, list):
@@ -321,60 +321,37 @@ def process_image(image_path, output_path=None, hide_window=False):
         )
         return False  # Indicate failure
 
-    # Proceed with reporting text box findings
-    if text_boxes:
-        print(
-            f"  Found {len(text_boxes)} potential text box(es) via GCP. (Detection time: {text_duration:.4f}s)"
-        )
-        print("    Text Bounding Boxes (x, y, width, height):")
-        for box in text_boxes:
-            print(f"      - {box}")
-    else:
-        print(f"  Found 0 text boxes via GCP. (Detection time: {text_duration:.4f}s)")
-
     # --- Tissue Detection (Gemini) ---
     print("  Finding tissue regions (using Gemini)...")
     tissue_start = time.time()
-    gemini_response: list[BoundingBox] = []
+    # gemini_response: list[BoundingBox] = []
     gemini_tissue_boxes_abs: list[tuple[int, int, int, int]] = []
     gemini_text_boxes_abs: list[tuple[int, int, int, int]] = []
-    try:
-        # Assuming gemini_extract_tissue handles its own auth/config via env vars or defaults
-        # Pass None for project/location initially, relying on its internal handling
-        gemini_response = gemini_extract(
-            file_path=image_path,
-        )
-        if gemini_response:
-            # Convert relative coordinates to absolute pixel coordinates
-            for box in gemini_response:
-                x_abs = int(box["x"] * img_width)
-                y_abs = int(box["y"] * img_height)
-                w_abs = int(box["width"] * img_width)
-                h_abs = int(box["height"] * img_height)
-                # Basic validation
-                if w_abs <= 0 or h_abs <= 0:
-                    print(
-                        f"    - Warning: Skipping invalid tissue box dimension from Gemini: {box}"
-                    )
-                    continue
-                if box["label"] == "tissue":
-                    gemini_tissue_boxes_abs.append((x_abs, y_abs, w_abs, h_abs))
-                    print(
-                        f"    - Tissue Label: {box['label']}, Rect: {(x_abs, y_abs, w_abs, h_abs)}"
-                    )
-                elif box["label"] == "text":
-                    gemini_text_boxes_abs.append((x_abs, y_abs, w_abs, h_abs))
-                    print(
-                        f"    - Text Label: {box['label']}, Rect: {(x_abs, y_abs, w_abs, h_abs)}"
-                    )
-                else:
-                    print(
-                        f"    - Warning: Skipping invalid tissue box dimension from Gemini: {box}"
-                    )
-
-    except Exception as e:
-        print(f"  Error during Gemini tissue detection: {e}", file=sys.stderr)
-        # Continue processing without tissue filtering if Gemini fails
+    for box in gemini_response:
+        x_abs = int(box["x"] * img_width)
+        y_abs = int(box["y"] * img_height)
+        w_abs = int(box["width"] * img_width)
+        h_abs = int(box["height"] * img_height)
+        # Basic validation
+        if w_abs <= 0 or h_abs <= 0:
+            print(
+                f"    - Warning: Skipping invalid tissue box dimension from Gemini: {box}"
+            )
+            continue
+        if box["label"] == "tissue":
+            gemini_tissue_boxes_abs.append((x_abs, y_abs, w_abs, h_abs))
+            print(
+                f"    - Tissue Label: {box['label']}, Rect: {(x_abs, y_abs, w_abs, h_abs)}"
+            )
+        elif box["label"] == "text":
+            gemini_text_boxes_abs.append((x_abs, y_abs, w_abs, h_abs))
+            print(
+                f"    - Text Label: {box['label']}, Rect: {(x_abs, y_abs, w_abs, h_abs)}"
+            )
+        else:
+            print(
+                f"    - Warning: Skipping invalid tissue box dimension from Gemini: {box}"
+            )
 
     tissue_duration = time.time() - tissue_start
     print(
@@ -515,7 +492,7 @@ def process_image(image_path, output_path=None, hide_window=False):
     return True  # Indicate success
 
 
-def main():
+async def main():
     total_start_time = time.time()
 
     parser = argparse.ArgumentParser(
@@ -618,7 +595,7 @@ def main():
                 output_path = args.output
 
         # Call the processing function
-        success = process_image(image_path, output_path, args.hide_window)
+        success = await process_image(image_path, output_path, args.hide_window)
 
         if success:
             processed_count += 1
@@ -634,4 +611,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
