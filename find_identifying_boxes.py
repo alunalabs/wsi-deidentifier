@@ -1,4 +1,5 @@
 import argparse
+import glob
 import os  # For GCP auth check and path handling
 import sys  # Import sys for exit
 import time  # Add time import
@@ -10,18 +11,26 @@ from pyzbar import pyzbar
 
 from gcp_textract import detect_text  # Import the function
 
-# Optional: Default Tesseract path (can be overridden by command line argument)
-# On Windows, it might be: r'C:\Program Files\Tesseract-OCR\tesseract.exe'
-# On macOS (via Homebrew): '/opt/homebrew/bin/tesseract' or '/usr/local/bin/tesseract'
-# On Linux (default install): '/usr/bin/tesseract'
-# Set this if Tesseract is not in your system's PATH
-# pytesseract.pytesseract.tesseract_cmd = '/path/to/tesseract'
-
 # https://github.com/NaturalHistoryMuseum/pyzbar/issues/131
 # export DYLD_FALLBACK_LIBRARY_PATH=$(brew --prefix zbar)/lib/
 # export DYLD_FALLBACK_LIBRARY_PATH=$(brew --prefix libdmtx)/lib/
 
 # export DYLD_FALLBACK_LIBRARY_PATH=$(brew --prefix zbar)/lib/:$(brew --prefix libdmtx)/lib/
+
+
+# --- Usage Examples ---
+# Process a single image and display the result:
+# uv run python find_identifying_boxes.py ./sample/macro_images/GR24-4430_A_HE_M_78_macro.jpg
+#
+# Process a single image and save the annotated output:
+# uv run python find_identifying_boxes.py ./sample/macro_images/GR24-4430_A_HE_M_78_macro.jpg --output ./sample/macro_images_annotated/GR24-4430_A_HE_M_78_macro_annotated.jpg
+#
+# Process all JPG images in a directory and save annotated versions to another directory:
+# uv run python find_identifying_boxes.py ./sample/macro_images/*.jpg --output ./sample/macro_images_annotated/
+#
+# Process multiple specific images and save annotated versions to a directory:
+# uv run python find_identifying_boxes.py ./sample/macro_images/img1.jpg ./sample/macro_images/img2.png --output ./sample/macro_images_annotated/
+# ---
 
 
 def find_barcodes(image):
@@ -224,19 +233,153 @@ def display_image(window_name, image):
     print(f"Image display function took: {duration:.4f} seconds")
 
 
+def process_image(image_path, output_path=None, hide_window=False):
+    """Processes a single image: loads, finds boxes, draws/saves/displays."""
+    process_start_time = time.time()
+    print(f"--- Processing {image_path} ---")
+
+    # Load the image using OpenCV
+    load_start = time.time()
+    image = cv2.imread(image_path)
+    load_duration = time.time() - load_start
+    if image is None:
+        print(f"Error: Could not load image from path: {image_path}", file=sys.stderr)
+        return False  # Indicate failure
+    print(f"  Image loaded. (Load time: {load_duration:.4f}s)")
+
+    # --- Barcode Detection ---
+    print("  Finding barcodes (QR, DataMatrix, etc.)...")
+    barcode_start = time.time()
+    barcode_boxes = find_barcodes(image)  # Use renamed function
+    barcode_duration = time.time() - barcode_start
+    print(
+        f"  Found {len(barcode_boxes)} barcode(s). (Detection time: {barcode_duration:.4f}s)"
+    )
+    if barcode_boxes:
+        print("    Barcode Details:")
+        for box_info in barcode_boxes:
+            print(
+                f"      - Type: {box_info['type']}, Rect: {box_info['rect']}, Data: {box_info['data'][:30]}..."
+            )  # Print type and truncated data
+
+    # --- Text Detection ---
+    print("  Finding text boxes (using Google Cloud Vision)...")  # Updated print
+    text_start = time.time()
+    # Now returns only a list of boxes
+    text_boxes = find_text_boxes(image_path)
+    text_duration = time.time() - text_start
+
+    # Simplified error check (find_text_boxes returns [] on init or processing error)
+    if not isinstance(text_boxes, list):
+        # This case shouldn't happen with current logic, but as a safeguard
+        print(
+            "  An unexpected error occurred during GCP text detection.", file=sys.stderr
+        )
+        return False  # Indicate failure
+
+    # Proceed with reporting text box findings
+    if text_boxes:
+        print(
+            f"  Found {len(text_boxes)} potential text box(es) via GCP. (Detection time: {text_duration:.4f}s)"
+        )
+        print("    Text Bounding Boxes (x, y, width, height):")
+        for box in text_boxes:
+            print(f"      - {box}")
+    else:
+        print(f"  Found 0 text boxes via GCP. (Detection time: {text_duration:.4f}s)")
+
+    # Combine boxes for drawing/counting
+    all_boxes = []
+    if barcode_boxes:  # Check if barcode_boxes is not None/empty
+        all_boxes.extend([b["rect"] for b in barcode_boxes])
+    if text_boxes:  # Check if text_boxes is not None/empty
+        all_boxes.extend(text_boxes)
+
+    # Calculate encompassing box
+    encompassing_box = None
+    if all_boxes:
+        min_x = min(box[0] for box in all_boxes)
+        min_y = min(box[1] for box in all_boxes)
+        max_x_w = max(box[0] + box[2] for box in all_boxes)
+        max_y_h = max(box[1] + box[3] for box in all_boxes)
+        enc_w = max_x_w - min_x
+        enc_h = max_y_h - min_y
+        encompassing_box = (min_x, min_y, enc_w, enc_h)
+        print(f"  Calculated encompassing box: {encompassing_box}")
+
+    print(f"  Total identifying boxes found: {len(all_boxes)}")
+
+    # --- Output / Display ---
+    draw_start = time.time()
+    output_image_generated = False
+    if output_path or (all_boxes and not hide_window):
+        print("  Drawing bounding boxes on image...")
+        output_image = draw_boxes(image, barcode_boxes, text_boxes, encompassing_box)
+        output_image_generated = True
+        draw_duration = time.time() - draw_start
+        print(f"  Drawing boxes took: {draw_duration:.4f} seconds")
+    else:
+        output_image = None  # No drawing needed if not saving/displaying
+
+    save_display_start = time.time()
+    if output_path:
+        # Save the image
+        try:
+            # Ensure the output directory exists
+            output_dir = os.path.dirname(output_path)
+            if output_dir:
+                os.makedirs(output_dir, exist_ok=True)
+            cv2.imwrite(output_path, output_image)
+            print(f"  Saved output image with boxes to: {output_path}")
+        except cv2.error as e:
+            print(
+                f"  Error saving image to {output_path}. OpenCV error: {e}",
+                file=sys.stderr,
+            )
+            return False  # Indicate failure
+        except Exception as e:
+            print(
+                f"  An unexpected error occurred saving image to {output_path}: {e}",
+                file=sys.stderr,
+            )
+            return False  # Indicate failure
+    elif output_image_generated and not hide_window:
+        # Display the image if boxes were found, no output path given, and not hidden
+        print("  Displaying image with detected boxes...")
+        display_image(
+            f"Detected Boxes (Barcode: Green, Text: Red) - {os.path.basename(image_path)}",
+            output_image,
+        )
+    elif not all_boxes:
+        print("  No barcodes or text boxes were found to display or save.")
+    elif hide_window:
+        print("  Image display skipped due to --hide-window flag.")
+
+    save_display_duration = time.time() - save_display_start
+    if output_path or (output_image_generated and not hide_window):
+        print(f"  Saving/Displaying image took: {save_display_duration:.4f} seconds")
+
+    process_duration = time.time() - process_start_time
+    print(f"--- Finished processing {image_path} in {process_duration:.4f} seconds ---")
+    return True  # Indicate success
+
+
 def main():
     total_start_time = time.time()
 
     parser = argparse.ArgumentParser(
-        description="Detect QR codes and text regions in an image and output bounding boxes.",
+        description="Detect QR codes and text regions in images using GCP Vision and barcode libraries. Annotates images with bounding boxes.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,  # Corrected syntax/ensure no corruption here
     )
     parser.add_argument(
-        "image_path", help="Path to the input image file."
-    )  # Corrected syntax
+        "input_paths",
+        nargs="+",  # Accept one or more arguments
+        help="Path(s) or glob pattern(s) to the input image file(s). Example: image.jpg or 'images/*.png'",
+    )
     parser.add_argument(
         "--output",
-        help="Optional path to save the image with bounding boxes drawn. If not provided, tries to display the image.",
+        help="Optional path. If processing a single image, this is the output file path. "
+        "If processing multiple images, this is the output directory path where annotated images will be saved.",
         default=None,
     )
     parser.add_argument(
@@ -247,7 +390,40 @@ def main():
 
     args = parser.parse_args()
 
-    # --- Add GCP Authentication Check ---
+    # --- Expand input paths (handle globs) ---
+    image_files = []
+    for path_pattern in args.input_paths:
+        expanded_paths = glob.glob(path_pattern)
+        if not expanded_paths:
+            print(
+                f"Warning: No files found matching pattern '{path_pattern}'. Skipping.",
+                file=sys.stderr,
+            )
+        else:
+            image_files.extend(expanded_paths)
+
+    if not image_files:
+        print("Error: No valid input image files found.", file=sys.stderr)
+        sys.exit(1)
+
+    print(f"Found {len(image_files)} image(s) to process.")
+
+    # --- Determine output mode (single file vs directory) ---
+    is_output_dir = False
+    if args.output:
+        if len(image_files) > 1:
+            is_output_dir = True
+            # Create the output directory if it doesn't exist
+            os.makedirs(args.output, exist_ok=True)
+            print(f"Output directory set to: {args.output}")
+        else:
+            # Single file output: ensure parent directory exists
+            output_dir = os.path.dirname(args.output)
+            if output_dir:
+                os.makedirs(output_dir, exist_ok=True)
+            print(f"Output file set to: {args.output}")
+
+    # --- GCP Authentication Check (only once) ---
     creds_env = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
     default_creds_path = os.path.expanduser(
         "~/.config/gcloud/application_default_credentials.json"
@@ -268,128 +444,42 @@ def main():
         print(f"Using application default credentials found at: {default_creds_path}")
     # --- End GCP Auth Check ---
 
-    # Load the image using OpenCV
-    load_start = time.time()
-    image = cv2.imread(args.image_path)
-    load_duration = time.time() - load_start
-    if image is None:
-        print(
-            f"Error: Could not load image from path: {args.image_path}", file=sys.stderr
-        )
-        sys.exit(1)
-    print(f"Processing image: {args.image_path} (Load time: {load_duration:.4f}s)")
+    processed_count = 0
+    failed_count = 0
 
-    # --- Barcode Detection ---
-    print("Finding barcodes (QR, DataMatrix, etc.)...")
-    barcode_start = time.time()
-    barcode_boxes = find_barcodes(image)  # Use renamed function
-    barcode_duration = time.time() - barcode_start
-    print(
-        f"Found {len(barcode_boxes)} barcode(s). (Detection time: {barcode_duration:.4f}s)"
-    )
-    if barcode_boxes:
-        print("Barcode Details:")
-        for box_info in barcode_boxes:
-            print(
-                f"  - Type: {box_info['type']}, Rect: {box_info['rect']}, Data: {box_info['data'][:30]}..."
-            )  # Print type and truncated data
+    # --- Process each image file ---
+    for i, image_path in enumerate(image_files):
+        print(f"\nProcessing image {i + 1}/{len(image_files)}: {image_path}")
 
-    # --- Text Detection ---
-    print("Finding text boxes (using Google Cloud Vision)...")  # Updated print
-    text_start = time.time()
-    # Now returns only a list of boxes
-    text_boxes = find_text_boxes(args.image_path)
-    text_duration = time.time() - text_start
+        output_path = None
+        if args.output:
+            if is_output_dir:
+                # Construct output path in the directory
+                base_name = os.path.basename(image_path)
+                # Optional: add a suffix like '_annotated'
+                # name, ext = os.path.splitext(base_name)
+                # output_filename = f"{name}_annotated{ext}"
+                output_path = os.path.join(
+                    args.output, base_name
+                )  # Keep original name for now
+            else:
+                # Use the specific output path provided (only for single input)
+                output_path = args.output
 
-    # Simplified error check (find_text_boxes returns [] on init or processing error)
-    if not isinstance(text_boxes, list):
-        # This case shouldn't happen with current logic, but as a safeguard
-        print(
-            "An unexpected error occurred during GCP text detection.", file=sys.stderr
-        )
-        sys.exit(1)
+        # Call the processing function
+        success = process_image(image_path, output_path, args.hide_window)
 
-    # Proceed with reporting text box findings
-    if text_boxes:
-        print(
-            f"Found {len(text_boxes)} potential text box(es) via GCP. (Detection time: {text_duration:.4f}s)"
-        )
-        print("Text Bounding Boxes (x, y, width, height):")
-        for box in text_boxes:
-            print(f"  - {box}")
-    else:
-        # Adjust message slightly if it could be an empty list vs None
-        # (find_text_boxes now always returns a list)
-        print(f"Found 0 text boxes via GCP. (Detection time: {text_duration:.4f}s)")
+        if success:
+            processed_count += 1
+        else:
+            failed_count += 1
 
-    # Combine boxes for drawing/counting (only if text_boxes is a list)
-    all_boxes = []
-    if barcode_boxes:  # Check if barcode_boxes is not None/empty
-        all_boxes.extend([b["rect"] for b in barcode_boxes])
-    if text_boxes:  # Check if text_boxes is not None/empty
-        all_boxes.extend(text_boxes)
-
-    # Calculate encompassing box
-    encompassing_box = None
-    if all_boxes:
-        min_x = min(box[0] for box in all_boxes)
-        min_y = min(box[1] for box in all_boxes)
-        max_x_w = max(box[0] + box[2] for box in all_boxes)
-        max_y_h = max(box[1] + box[3] for box in all_boxes)
-        enc_w = max_x_w - min_x
-        enc_h = max_y_h - min_y
-        encompassing_box = (min_x, min_y, enc_w, enc_h)
-        print(f"\nCalculated encompassing box: {encompassing_box}")
-
-    print(f"\nTotal identifying boxes found: {len(all_boxes)}")
-
-    # --- Output / Display ---
-    draw_start = time.time()
-    output_image_generated = False
-    if args.output or (all_boxes and not args.hide_window):
-        print("Drawing bounding boxes on image...")
-        # Pass the barcode_boxes list (contains dicts) and text_boxes list to draw_boxes
-        output_image = draw_boxes(image, barcode_boxes, text_boxes, encompassing_box)
-        output_image_generated = True
-    else:
-        output_image = None  # No drawing needed
-    draw_duration = time.time() - draw_start
-    if output_image_generated:
-        print(f"Drawing boxes took: {draw_duration:.4f} seconds")
-
-    save_display_start = time.time()
-    if args.output:
-        # Save the image
-        try:
-            cv2.imwrite(args.output, output_image)
-            print(f"Saved output image with boxes to: {args.output}")
-        except cv2.error as e:
-            print(
-                f"Error saving image to {args.output}. OpenCV error: {e}",
-                file=sys.stderr,
-            )
-        except Exception as e:
-            print(
-                f"An unexpected error occurred saving image to {args.output}: {e}",
-                file=sys.stderr,
-            )
-    elif output_image_generated and not args.hide_window:
-        # Display the image if boxes were found, no output path given, and not hidden
-        print("Displaying image with detected boxes...")
-        display_image(
-            "Detected Boxes (Barcode: Green, Text: Red)", output_image
-        )  # Update window title
-    elif not all_boxes:
-        print("No barcodes or text boxes were found to display or save.")
-    elif args.hide_window:
-        print("Image display skipped due to --hide-window flag.")
-
-    save_display_duration = time.time() - save_display_start
-    if args.output or (output_image_generated and not args.hide_window):
-        print(f"Saving/Displaying image took: {save_display_duration:.4f} seconds")
-
+    # --- Summary ---
     total_duration = time.time() - total_start_time
-    print(f"\nTotal script execution time: {total_duration:.4f} seconds")
+    print("\n--- Processing Complete ---")
+    print(f"Successfully processed: {processed_count} image(s)")
+    print(f"Failed to process:    {failed_count} image(s)")
+    print(f"Total script execution time: {total_duration:.4f} seconds")
 
 
 if __name__ == "__main__":
