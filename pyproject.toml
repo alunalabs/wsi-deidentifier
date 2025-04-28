@@ -5,9 +5,16 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.10.0"
 dependencies = [
-    "openslide-bin>=4.0.0.8",
-    "openslide-python>=1.4.1",
-    "pillow>=11.2.1",
-    "tifffile>=2025.3.30",
-    "tinynumpy>=1.2.1",
+  "opencv-python>=4.11.0.86",
+  "openslide-bin>=4.0.0.8",
+  "openslide-python>=1.4.1",
+  "pillow>=11.2.1",
+  "pytesseract>=0.3.13",
+  "pyzbar>=0.1.9",
+  "tifffile>=2025.3.30",
+  "tinynumpy>=1.2.1",
+  "pylibdmtx",
 ]
+
+[tool.uv]
+# ... existing code ...
