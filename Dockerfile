@@ -28,8 +28,17 @@ RUN uv sync
 # Create directories for processed files
 RUN mkdir -p /data/input /data/output
 
-# Create entry script to ensure virtual environment is activated
+# Create entry script to ensure virtual environment is activated and handle authentication
 RUN echo '#!/bin/bash\n\
+# Check if credentials exist and are accessible\n\
+if [ -f "/root/.config/gcloud/application_default_credentials.json" ]; then\n\
+  echo "Using application default credentials from mounted volume"\n\
+elif [ -f "$GOOGLE_APPLICATION_CREDENTIALS" ]; then\n\
+  echo "Using service account credentials from GOOGLE_APPLICATION_CREDENTIALS"\n\
+else\n\
+  echo "Warning: No Google Cloud credentials found. Text detection using GCP Vision API may not work fully."\n\
+fi\n\
+# Activate virtual environment and run command\n\
 source .venv/bin/activate\n\
 python find_identifying_boxes.py "$@"' > /app/entrypoint.sh && \
     chmod +x /app/entrypoint.sh
