@@ -7,9 +7,16 @@ import shutil
 import struct
 import sys
 from pathlib import Path
+import asyncio
+import cv2
+import numpy as np
+from io import BytesIO
+from PIL import Image
 
 import tiffparser
 from replace_macro import replace_macro
+from PyPDF2 import PdfReader, PdfWriter
+from find_identifying_boxes import find_barcodes, find_text_boxes, process_image
 
 
 ###############################################################################
@@ -124,6 +131,126 @@ def strip_metadata(path: Path) -> None:
                 fp.write(b"\0" * pad)
 
 
+def extract_images_from_pdf(pdf_path: Path) -> list[tuple[Image.Image, tuple[int, int, int, int]]]:
+    """Extract images from a PDF along with their positions."""
+    reader = PdfReader(str(pdf_path))
+    images = []
+    
+    for page_num, page in enumerate(reader.pages):
+        if '/XObject' in page['/Resources']:
+            xObject = page['/Resources']['/XObject'].get_object()
+            
+            for obj in xObject:
+                if xObject[obj]['/Subtype'] == '/Image':
+                    # Get image data
+                    if xObject[obj]['/Filter'] == '/FlateDecode':
+                        data = xObject[obj].get_data()
+                        img = Image.open(BytesIO(data))
+                        # Get image position
+                        bbox = xObject[obj]['/BBox']
+                        images.append((img, bbox))
+    
+    return images
+
+def process_pdf_images(pdf_path: Path) -> list[tuple[int, int, int, int]]:
+    """Process images in a PDF to find PII regions."""
+    images = extract_images_from_pdf(pdf_path)
+    pii_regions = []
+    
+    for img, bbox in images:
+        # Convert PIL Image to OpenCV format
+        cv_img = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
+        
+        # Find barcodes
+        barcode_boxes = find_barcodes(cv_img)
+        
+        # Find text regions
+        # Save image temporarily for GCP Vision
+        temp_path = Path("temp_image.jpg")
+        img.save(temp_path)
+        text_boxes = find_text_boxes(str(temp_path))
+        temp_path.unlink()
+        
+        # Process with Gemini for PII detection
+        # Note: This would need to be adapted to work with the image directly
+        # For now, we'll use the barcode and text boxes as PII regions
+        for box in barcode_boxes:
+            x, y, w, h = box['rect']
+            # Convert to PDF coordinates
+            pdf_x = bbox[0] + x
+            pdf_y = bbox[1] + y
+            pii_regions.append((pdf_x, pdf_y, w, h))
+            
+        for box in text_boxes:
+            x, y, w, h = box
+            # Convert to PDF coordinates
+            pdf_x = bbox[0] + x
+            pdf_y = bbox[1] + y
+            pii_regions.append((pdf_x, pdf_y, w, h))
+    
+    return pii_regions
+
+def redact_pdf_regions(pdf_path: Path, regions: list[tuple[int, int, int, int]]) -> None:
+    """Redact identified PII regions in a PDF."""
+    reader = PdfReader(str(pdf_path))
+    writer = PdfWriter()
+    
+    for page in reader.pages:
+        # Create a new page with redactions
+        page = page.get_object()
+        
+        # Add redaction rectangles for each region
+        for x, y, w, h in regions:
+            # Create a redaction rectangle
+            page.merge_page({
+                '/Type': '/Annot',
+                '/Subtype': '/Redact',
+                '/Rect': [x, y, x + w, y + h],
+                '/OC': {
+                    '/Type': '/OCG',
+                    '/Name': 'Redaction',
+                    '/Usage': {
+                        '/View': {'/ViewState': 'OFF'},
+                        '/Print': {'/PrintState': 'OFF'},
+                    }
+                }
+            })
+        
+        writer.add_page(page)
+    
+    # Save the redacted PDF
+    with pdf_path.open('wb') as output_file:
+        writer.write(output_file)
+
+def strip_pdf_metadata(path: Path) -> None:
+    """Strip metadata and redact PII from a PDF file."""
+    # First process images to find PII
+    print(f"Processing images in {path} for PII detection...")
+    pii_regions = process_pdf_images(path)
+    
+    if pii_regions:
+        print(f"Found {len(pii_regions)} PII regions to redact")
+        # Redact the identified regions
+        redact_pdf_regions(path, pii_regions)
+    else:
+        print("No PII regions found")
+    
+    # Remove metadata
+    reader = PdfReader(str(path))
+    writer = PdfWriter()
+
+    # Copy all pages
+    for page in reader.pages:
+        writer.add_page(page)
+
+    # Remove all metadata
+    writer.metadata = {}
+
+    # Save the new PDF
+    with path.open("wb") as output_file:
+        writer.write(output_file)
+
+
 ###############################################################################
 # Helper Functions (including new one)
 ###############################################################################
@@ -164,7 +291,7 @@ def process_slide(
     macro_description: str,
     rect_coords: tuple[int, int, int, int] | None,
 ) -> None:
-    if src.suffix.lower() not in [".svs", ".tif", ".tiff"]:
+    if src.suffix.lower() not in [".svs", ".tif", ".tiff", ".pdf"]:
         return
     slide_id = src.stem
     hashed_id = hash_id(slide_id, salt)
@@ -173,28 +300,31 @@ def process_slide(
     dst.parent.mkdir(parents=True, exist_ok=True)
     shutil.copyfile(src, dst)
 
-    delete_associated_image(dst, "label")
-    strip_metadata(dst)
-
-    # Check if macro exists before trying to replace it
-    if check_macro_exists(dst, macro_description):
-        print(f"  Replacing macro ({macro_description}) in {dst}")
-        try:
-            replace_macro(
-                str(dst),
-                str(dst),
-                macro_description=macro_description,
-                rect_coords=rect_coords,
-            )
-        except Exception as e:
-            print(
-                f"  Error replacing macro in {dst}: {e}",
-                file=sys.stderr,
-            )
+    if src.suffix.lower() == ".pdf":
+        strip_pdf_metadata(dst)
     else:
-        print(
-            f"  Macro ({macro_description}) not found or inaccessible in {dst}, skipping replacement."
-        )
+        delete_associated_image(dst, "label")
+        strip_metadata(dst)
+
+        # Check if macro exists before trying to replace it
+        if check_macro_exists(dst, macro_description):
+            print(f"  Replacing macro ({macro_description}) in {dst}")
+            try:
+                replace_macro(
+                    str(dst),
+                    str(dst),
+                    macro_description=macro_description,
+                    rect_coords=rect_coords,
+                )
+            except Exception as e:
+                print(
+                    f"  Error replacing macro in {dst}: {e}",
+                    file=sys.stderr,
+                )
+        else:
+            print(
+                f"  Macro ({macro_description}) not found or inaccessible in {dst}, skipping replacement."
+            )
 
     writer.writerow(
         {
@@ -208,10 +338,10 @@ def process_slide(
 
 def main(argv=None):
     p = argparse.ArgumentParser(
-        description="Copy .svs or .tif slides, strip label/macro images, scrub metadata, and rename using salted hash"
+        description="Copy .svs, .tif, or .pdf files, strip label/macro images (for slides), scrub metadata, and rename using salted hash"
     )
     p.add_argument(
-        "slides", nargs="+", help="paths or glob patterns to .svs or .tif files"
+        "slides", nargs="+", help="paths or glob patterns to .svs, .tif, or .pdf files"
     )
     p.add_argument("-o", "--out", default="deidentified", help="output directory")
     p.add_argument("--salt", required=True, help="secret salt")

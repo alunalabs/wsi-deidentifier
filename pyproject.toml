@@ -17,6 +17,7 @@ dependencies = [
   "pyzbar>=0.1.9",
   "tifffile>=2025.3.30",
   "tinynumpy>=1.2.1",
+  "PyPDF2>=3.0.0",
 ]
 
 [tool.uv]
