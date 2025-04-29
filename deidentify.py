@@ -1,4 +1,38 @@
 #!/usr/bin/env python3
+"""
+De-identifies Whole Slide Image (WSI) files by removing PHI from metadata and macro images.
+
+This script processes WSI files (.svs, .tif, .tiff) to remove potentially identifying information.
+It can work with pre-identified bounding boxes from identify_boxes.py or use default/specified
+rectangles for masking.
+
+Usage Examples
+-------------
+# Process slides using pre-identified bounding boxes
+uv run python deidentify.py "sample/identified/*.svs" --salt "your-secret-salt" --boxes-json identified_boxes.json
+
+# Default centered rectangle
+uv run python deidentify.py "sample/identified/*.{svs,tif,tiff}" \\
+    --salt "your-secret-salt-here" \\
+    -o sample/deidentified \\
+    -m sample/hash_mapping.csv \\
+    --macro-description "macro"
+
+# Specify custom rectangle coordinates (x0 y0 x1 y1)
+uv run python deidentify.py "path/to/slides/*.svs" \\
+    --salt "your-secret-salt-here" \\
+    -o output_dir \\
+    --rect 100 150 500 600
+
+The script will:
+1. Copy input slides to a specified output directory
+2. Rename them using a salted hash derived from the original filename
+3. Remove the "label" image (which often contains PHI)
+4. Redact the "macro" image by masking areas containing PHI
+5. Strip non-technical metadata fields
+6. Generate a CSV mapping of original to hashed filenames
+"""
+
 import argparse
 import csv
 import hashlib

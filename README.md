@@ -20,20 +20,24 @@ This tool processes Whole Slide Image (WSI) files (`.svs`, `.tif`, `.tiff`) to r
 
 ```bash
 uv sync
+
+# for macos
+brew install zbar libdmtx
+export DYLD_FALLBACK_LIBRARY_PATH=$(brew --prefix zbar)/lib/:$(brew --prefix libdmtx)/lib/
 ```
 
 # Recommended Workflow
 
 ## 1. Identify Bounding Boxes (Pre-processing)
 
-First, identify areas containing PHI in the slides using the `find_identifying_boxes.py` script:
+First, identify areas containing PHI in the slides using the `identify_boxes.py` script:
 
 ```bash
 # Identify bounding boxes in macro images and save to JSON (saves to ./identified_boxes.json by default)
-uv run python find_identifying_boxes.py "./sample/macro_images/*.{jpg,png}" --output ./sample/macro_images_annotated/ --save-boxes-json
+uv run python identify_boxes.py "./sample/macro_images/*.{jpg,png}" --output ./sample/macro_images_annotated/ --save-boxes-json
 
 # To specify a custom JSON output path:
-uv run python find_identifying_boxes.py "./sample/macro_images/*.{jpg,png}" --boxes-json-path ./sample/identified_boxes.json
+uv run python identify_boxes.py "./sample/macro_images/*.{jpg,png}" --boxes-json-path ./sample/identified_boxes.json
 
 # You can inspect the JSON file to verify the identified boxes are correct
 ```
@@ -69,14 +73,14 @@ uv run deidentify.py "path/to/slides/*.svs" \
     --rect 100 150 500 600
 ```
 
-# Options for find_identifying_boxes.py
+# Options for identify_boxes.py
 
 - `input_paths`: One or more input file paths or glob patterns (e.g., `"*.jpg"`, `"path/to/image.png"`).
 - `--output`: Optional path for output annotated images. If processing multiple images, specifies the output directory.
 - `--hide-window`: Do not display the image window, even if no output path is specified.
 - `--project`: Google Cloud project ID for Vertex AI (Gemini).
 - `--location`: Google Cloud location for Vertex AI (Gemini).
-- `--save-boxes-json`: Save identified bounding boxes to a JSON file (identified_boxes.json) in the same directory as the output images.
+- `--save-boxes-json`: Save identified bounding boxes to a JSON file (identified_boxes.json) in the root directory.
 - `--boxes-json-path`: Custom path for the output JSON file with identified boxes.
 
 # Options for deidentify.py
