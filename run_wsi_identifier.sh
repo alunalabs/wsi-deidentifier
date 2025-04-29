@@ -13,21 +13,22 @@ show_help() {
   echo "  ./run_wsi_identifier.sh [OPTIONS]"
   echo
   echo "Options:"
-  echo "  --input-path PATH     Path to input image files (can be glob pattern)"
-  echo "  --output-path PATH    Path to output directory or file"
-  echo "  --help                Display this help message and exit"
-  echo "  --build               Build the Docker image before running"
-  echo "  --hide-window         Hide the image window (useful in headless environments)"
-  echo "  --gemini-api-key KEY  Google Gemini API key for tissue detection"
+  echo "  --input-path PATH      Path to input image files (can be glob pattern)"
+  echo "  --output-path PATH     Path to output directory or file"
+  echo "  --help                 Display this help message and exit"
+  echo "  --build                Build the Docker image before running"
+  echo "  --hide-window          Hide the image window (useful in headless environments)"
+  echo "  --project PROJECT_ID   Google Cloud project ID for Vertex AI (Gemini)"
+  echo "  --location LOCATION    Google Cloud location for Vertex AI (default: us-central1)"
   echo
   echo "Examples:"
   echo "  ./run_wsi_identifier.sh --input-path './sample/macro_images/*.jpg' --output-path './sample/macro_images_annotated/'"
   echo "  ./run_wsi_identifier.sh --build --input-path './sample/macro_images/GP14-5551_A_HE_macro.jpg' --output-path './sample/output.jpg'"
-  echo "  ./run_wsi_identifier.sh --gemini-api-key 'YOUR_API_KEY' --input-path './sample/macro_images/*.jpg' --output-path './sample/output/'"
+  echo "  ./run_wsi_identifier.sh --project 'my-gcp-project' --input-path './sample/macro_images/*.jpg' --output-path './sample/output/'"
   echo
   echo "Note: GCP authentication is required. Make sure to set GOOGLE_APPLICATION_CREDENTIALS"
   echo "      or run 'gcloud auth application-default login' before using this script."
-  echo "      For Gemini tissue detection, provide a Gemini API key with '--gemini-api-key'."
+  echo "      For tissue detection, set GOOGLE_CLOUD_PROJECT in your environment or use --project."
 }
 
 # Default values
@@ -35,7 +36,8 @@ BUILD_IMAGE=false
 HIDE_WINDOW=false
 INPUT_PATH=""
 OUTPUT_PATH=""
-GEMINI_API_KEY=""
+PROJECT=""
+LOCATION=""
 
 # Parse command line arguments
 while [[ $# -gt 0 ]]; do
@@ -60,8 +62,12 @@ while [[ $# -gt 0 ]]; do
       HIDE_WINDOW=true
       shift
       ;;
-    --gemini-api-key)
-      GEMINI_API_KEY="$2"
+    --project)
+      PROJECT="$2"
+      shift 2
+      ;;
+    --location)
+      LOCATION="$2"
       shift 2
       ;;
     *)
@@ -88,13 +94,26 @@ fi
 # Prepare Docker command
 DOCKER_CMD="docker run --rm"
 
-# Add Gemini API key if provided
-if [ ! -z "$GEMINI_API_KEY" ]; then
-  DOCKER_CMD="$DOCKER_CMD -e GEMINI_API_KEY=\"$GEMINI_API_KEY\""
-  echo "Using provided Gemini API key for tissue detection"
+# Add Google Cloud Project and Location if provided
+if [ ! -z "$PROJECT" ]; then
+  DOCKER_CMD="$DOCKER_CMD -e GOOGLE_CLOUD_PROJECT=\"$PROJECT\""
+  echo "Using provided Google Cloud project: $PROJECT"
+elif [ ! -z "$GOOGLE_CLOUD_PROJECT" ]; then
+  DOCKER_CMD="$DOCKER_CMD -e GOOGLE_CLOUD_PROJECT=\"$GOOGLE_CLOUD_PROJECT\""
+  echo "Using Google Cloud project from environment: $GOOGLE_CLOUD_PROJECT"
 else
-  echo "Note: No Gemini API key provided. Tissue detection will not work."
-  echo "To enable tissue detection, provide a key with --gemini-api-key"
+  echo "Warning: No Google Cloud project specified. Tissue detection may not work."
+  echo "To enable tissue detection, set GOOGLE_CLOUD_PROJECT or use --project"
+fi
+
+if [ ! -z "$LOCATION" ]; then
+  DOCKER_CMD="$DOCKER_CMD -e GOOGLE_CLOUD_LOCATION=\"$LOCATION\""
+  echo "Using provided Google Cloud location: $LOCATION"
+elif [ ! -z "$GOOGLE_CLOUD_LOCATION" ]; then
+  DOCKER_CMD="$DOCKER_CMD -e GOOGLE_CLOUD_LOCATION=\"$GOOGLE_CLOUD_LOCATION\""
+  echo "Using Google Cloud location from environment: $GOOGLE_CLOUD_LOCATION"
+else
+  echo "Using default Google Cloud location: us-central1"
 fi
 
 # Mount the GCP credentials if they exist
@@ -147,6 +166,15 @@ fi
 # Add hide-window flag if needed
 if [ "$HIDE_WINDOW" = true ]; then
   OUTPUT_ARG="$OUTPUT_ARG --hide-window"
+fi
+
+# Add project and location to command if specified
+if [ ! -z "$PROJECT" ]; then
+  OUTPUT_ARG="$OUTPUT_ARG --project \"$PROJECT\""
+fi
+
+if [ ! -z "$LOCATION" ]; then
+  OUTPUT_ARG="$OUTPUT_ARG --location \"$LOCATION\""
 fi
 
 # Run the Docker container

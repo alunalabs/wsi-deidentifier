@@ -16,7 +16,7 @@ This document summarizes the Docker setup created for the WSI De-identifier proj
    - Handles various command-line options including:
      - Input/output paths
      - Google Cloud credentials
-     - Gemini API key for tissue detection
+     - Google Cloud Project and Location for Vertex AI (Gemini)
      - Building the Docker image
 
 3. **README_DOCKER.md**
@@ -32,8 +32,9 @@ This document summarizes the Docker setup created for the WSI De-identifier proj
   - Automatically mounts application default credentials or service account JSON
   - Required for text detection in images
 
-- **Google Gemini API**
-  - Accepts API key via command-line parameter `--gemini-api-key`
+- **Google Vertex AI (Gemini)**
+  - Sets GOOGLE_CLOUD_PROJECT and GOOGLE_CLOUD_LOCATION environment variables
+  - Passes project and location parameters to find_identifying_boxes.py
   - Required for tissue detection in images
 
 ### Usage Flexibility
@@ -51,10 +52,11 @@ This document summarizes the Docker setup created for the WSI De-identifier proj
 
 2. Setup authentication:
    ```bash
-   # For Google Cloud Vision
+   # For Google Cloud Vision and Vertex AI
    gcloud auth application-default login
    
-   # For Gemini (obtain API key from https://ai.google.dev/)
+   # Set required environment variables
+   export GOOGLE_CLOUD_PROJECT="your-gcp-project-id"
    ```
 
 3. Run the tool:
@@ -62,12 +64,12 @@ This document summarizes the Docker setup created for the WSI De-identifier proj
    ./run_wsi_identifier.sh \
      --input-path "./sample/macro_images/GP14-5551_A_HE_macro.jpg" \
      --output-path "./sample/output/annotated.jpg" \
-     --gemini-api-key "YOUR_GEMINI_API_KEY" \
+     --project "your-gcp-project-id" \
      --hide-window
    ```
 
 ## Notes
 
-- Even without a Gemini API key, the barcode and text detection using Google Cloud Vision will still work
-- If neither authentication method is available, basic barcode detection will still function
+- Even without Vertex AI project configuration, the barcode and text detection using Google Cloud Vision will still work
+- If no Google Cloud authentication is available, basic barcode detection will still function
 - For production usage, consider using a service account JSON file instead of application default credentials
