@@ -18,8 +18,8 @@ import fitz
 
 import tiffparser
 from replace_macro import replace_macro
-from PyPDF2 import PdfReader
 from find_identifying_boxes import find_barcodes, find_text_boxes, process_image
+from pdf_processor import process_pdf
 
 
 ###############################################################################
@@ -259,8 +259,7 @@ def process_slide(
     shutil.copyfile(src, dst)
 
     if dst.suffix.lower() == ".pdf":
-        regions = process_pdf_images(dst)
-        redact_pdf_regions(dst, regions)
+        process_pdf(dst)
     else:
         delete_associated_image(dst, "label")
         strip_metadata(dst)
