@@ -8,8 +8,11 @@ and calculates bounding boxes for areas containing PHI that should be masked.
 
 Usage Examples
 -------------
+# Process SVS/TIFF slides directly and extract their macro images:
+uv run python identify_boxes.py "./sample/identified/*.{svs,tif,tiff}" --save-boxes-json
+
 # Process a single image and display the result:
-uv run python identify_boxes.py ./sample/macro_images/test_macro_image.jpg
+uv run python identify_boxes.py ./sample/macro_images/test_macro_image.jpg --show-preview
 
 # Process a single image and save the annotated output:
 uv run python identify_boxes.py ./sample/macro_images/test_macro_image.jpg --output ./sample/macro_images_annotated/test_macro_image.jpg
@@ -32,11 +35,12 @@ uv run python identify_boxes.py ./sample/macro_images/*.jpg --save-boxes-json
 
 The script will:
 1. Process all images matching the given pattern(s)
-2. Detect text and barcodes using Google Cloud Vision API
-3. Identify tissue regions using Gemini API to avoid masking them
-4. Generate bounding boxes for areas containing PHI
-5. Save results to a JSON file for later use with deidentify.py
-6. Optionally create annotated versions of the images showing the detected regions
+2. Extract macro images from SVS/TIFF files if present
+3. Detect text and barcodes using Google Cloud Vision API
+4. Identify tissue regions using Gemini API to avoid masking them
+5. Generate bounding boxes for areas containing PHI
+6. Save results to a JSON file for later use with deidentify.py
+7. Optionally create annotated versions of the images showing the detected regions
 """
 
 import argparse
@@ -44,11 +48,16 @@ import asyncio
 import glob
 import json
 import os
+import re
 import sys
 import time
+import tempfile
+from pathlib import Path
 
 import cv2
 import numpy as np
+import openslide
+from PIL import Image
 from pylibdmtx.pylibdmtx import decode as dmtx_decode
 from pyzbar import pyzbar
 
@@ -59,6 +68,52 @@ from gemini_extract import (
 
 # https://github.com/NaturalHistoryMuseum/pyzbar/issues/131
 # export DYLD_FALLBACK_LIBRARY_PATH=$(brew --prefix zbar)/lib/:$(brew --prefix libdmtx)/lib/
+
+
+def extract_macro_from_slide(slide_path, macro_description="macro"):
+    """
+    Extracts the macro image from an SVS/TIFF slide file.
+    
+    Args:
+        slide_path (str): Path to the slide file
+        macro_description (str): String identifier for the macro image (default: 'macro')
+        
+    Returns:
+        tuple: (temp_file_path, success)
+            - temp_file_path (str): Path to the extracted macro image saved as a temporary JPEG file
+            - success (bool): True if extraction was successful, False otherwise
+    """
+    print(f"Extracting macro image from slide: {slide_path}")
+    try:
+        # Try using OpenSlide
+        with openslide.OpenSlide(slide_path) as slide:
+            macro_image = slide.associated_images.get("macro")
+            
+            if macro_image is None:
+                # Try alternative keys that might contain the macro
+                for key in slide.associated_images:
+                    if macro_description.lower() in key.lower():
+                        macro_image = slide.associated_images[key]
+                        print(f"  Found macro image with key: {key}")
+                        break
+            
+            if macro_image is None:
+                print(f"  No macro image found in slide: {slide_path}")
+                return None, False
+            
+            # Convert to RGB to ensure JPEG compatibility
+            macro_image = macro_image.convert("RGB")
+            
+            # Save to temporary file
+            _, temp_file = tempfile.mkstemp(suffix=".jpg")
+            macro_image.save(temp_file, "JPEG", quality=95)
+            
+            print(f"  Macro image extracted and saved to: {temp_file}")
+            return temp_file, True
+            
+    except Exception as e:
+        print(f"  Error extracting macro from slide {slide_path}: {e}", file=sys.stderr)
+        return None, False
 
 
 def check_intersection(
@@ -301,13 +356,34 @@ def display_image(window_name, image):
 async def process_image(
     image_path,
     output_path=None,
-    hide_window=False,
+    show_preview=False,
     project: str | None = None,
     location: str | None = None,
+    macro_description: str = "macro",
+    temp_file_to_cleanup: str | None = None,
 ):
     """Processes a single image: loads, finds boxes, draws/saves/displays."""
     process_start_time = time.time()
     print(f"--- Processing {image_path} ---")
+    
+    # Check if this is an SVS/TIFF slide file
+    is_slide = False
+    original_path = image_path
+    file_extension = os.path.splitext(image_path.lower())[1]
+    
+    if file_extension in ['.svs', '.tif', '.tiff']:
+        is_slide = True
+        print(f"Detected slide file format: {file_extension}")
+        # Extract the macro image to a temporary file
+        temp_macro_path, success = extract_macro_from_slide(image_path, macro_description)
+        if success:
+            # Use the temporary file for processing
+            image_path = temp_macro_path
+            temp_file_to_cleanup = temp_macro_path
+            print(f"Using extracted macro for processing: {image_path}")
+        else:
+            print(f"Warning: Failed to extract macro from slide, skipping: {image_path}", file=sys.stderr)
+            return False, None  # Indicate failure and return None for box data
 
     # Load the image using OpenCV
     load_start = time.time()
@@ -315,6 +391,10 @@ async def process_image(
     load_duration = time.time() - load_start
     if image is None:
         print(f"Error: Could not load image from path: {image_path}", file=sys.stderr)
+        # Clean up any temporary file
+        if temp_file_to_cleanup and os.path.exists(temp_file_to_cleanup):
+            os.remove(temp_file_to_cleanup)
+            print(f"Cleaned up temporary file: {temp_file_to_cleanup}")
         return False, None  # Indicate failure and return None for box data
     print(f"  Image loaded. (Load time: {load_duration:.4f}s)")
 
@@ -458,7 +538,7 @@ async def process_image(
 
     # Prepare box data for return/JSON
     box_data = {
-        "file_path": str(os.path.abspath(image_path)),
+        "file_path": str(os.path.abspath(original_path if is_slide else image_path)),
         "macro_path": str(os.path.abspath(image_path)),
         "rect_coords": encompassing_box,
         "individual_boxes": [
@@ -470,10 +550,9 @@ async def process_image(
     # --- Output / Display ---
     draw_start = time.time()
     output_image_generated = False
-    # Draw if output path specified, or if there are *any* boxes (including tissue), or if hidden
-    # Logic slightly adjusted: always draw if output path exists. Draw if not hidden and *any* box type exists.
+    # Draw if output path specified, or if there are *any* boxes (including tissue) and preview is requested
     if output_path or (
-        (filtered_all_rects or gemini_tissue_boxes_abs) and not hide_window
+        (filtered_all_rects or gemini_tissue_boxes_abs) and show_preview
     ):
         print("  Drawing bounding boxes on image...")
         # Pass filtered barcode/text lists and the absolute tissue boxes
@@ -512,8 +591,8 @@ async def process_image(
                 file=sys.stderr,
             )
             return False, None  # Indicate failure and return None for box data
-    elif output_image_generated and not hide_window:
-        # Display the image if boxes were found, no output path given, and not hidden
+    elif output_image_generated and show_preview:
+        # Display the image if boxes were found, no output path given, and preview is requested
         print("  Displaying image with detected boxes...")
         display_image(
             f"Detected Boxes (Barcode: Green, Text: Red, Tissue: Blue) - {os.path.basename(image_path)}",
@@ -523,15 +602,24 @@ async def process_image(
         print(
             "  No barcodes, text boxes, or tissue boxes were found to display or save."
         )
-    elif hide_window:
-        print("  Image display skipped due to --hide-window flag.")
+    elif not show_preview and output_image_generated:
+        print("  Image preview skipped. Use --show-preview flag to display images.")
 
     save_display_duration = time.time() - save_display_start
-    if output_path or (output_image_generated and not hide_window):
+    if output_path or (output_image_generated and show_preview):
         print(f"  Saving/Displaying image took: {save_display_duration:.4f} seconds")
 
     process_duration = time.time() - process_start_time
     print(f"--- Finished processing {image_path} in {process_duration:.4f} seconds ---")
+    
+    # Clean up any temporary file
+    if temp_file_to_cleanup and os.path.exists(temp_file_to_cleanup):
+        try:
+            os.remove(temp_file_to_cleanup)
+            print(f"Cleaned up temporary file: {temp_file_to_cleanup}")
+        except Exception as e:
+            print(f"Warning: Failed to clean up temporary file {temp_file_to_cleanup}: {e}", file=sys.stderr)
+    
     return True, box_data  # Return box data along with success indicator
 
 
@@ -554,9 +642,9 @@ async def main():
         default=None,
     )
     parser.add_argument(
-        "--hide-window",
+        "--show-preview",
         action="store_true",
-        help="Do not display the image window, even if no output path is specified.",
+        help="Display the image preview window. By default, no preview is shown.",
     )
     parser.add_argument(
         "--project",
@@ -580,20 +668,41 @@ async def main():
         help="Custom path for the output JSON file with identified boxes. If not specified, the default is identified_boxes.json in the same directory as the output images.",
         default=None,
     )
+    parser.add_argument(
+        "--macro-description",
+        default="macro",
+        help="String identifier for the macro image in SVS/TIFF files (default: 'macro'). Case-insensitive.",
+    )
 
     args = parser.parse_args()
 
-    # --- Expand input paths (handle globs) ---
+    # --- Expand input paths (handle globs and brace expansion) ---
     image_files = []
     for path_pattern in args.input_paths:
-        expanded_paths = glob.glob(path_pattern)
-        if not expanded_paths:
-            print(
-                f"Warning: No files found matching pattern '{path_pattern}'. Skipping.",
-                file=sys.stderr,
-            )
-        else:
-            image_files.extend(expanded_paths)
+        print(f"Processing pattern: {path_pattern}")
+        expanded_patterns = []
+        # Basic brace expansion
+        match = re.match(r"(.*)\{(.*)\}(.*)", path_pattern)
+        if match:
+            base, exts_str, suffix = match.groups()
+            extensions = exts_str.split(",")
+            expanded_patterns = [f"{base}{ext}{suffix}" for ext in extensions]
+            print(f"  Expanded to: {expanded_patterns}")
+        else:  # No braces or malformed, use as is
+            expanded_patterns = [path_pattern]
+
+        # Process each expanded pattern using Path().glob()
+        for exp_pattern in expanded_patterns:
+            pattern_paths = list(Path().glob(exp_pattern))
+            if pattern_paths:
+                print(f"  Found {len(pattern_paths)} files for pattern '{exp_pattern}'")
+                for path in pattern_paths:
+                    image_files.append(str(path))
+            else:
+                print(f"  No files found for pattern '{exp_pattern}'")
+    
+    # Remove duplicates while preserving order
+    image_files = list(dict.fromkeys(image_files))
 
     if not image_files:
         print("Error: No valid input image files found.", file=sys.stderr)
@@ -661,14 +770,15 @@ async def main():
     async def process_with_semaphore(
         image_path,
         output_path,
-        hide_window,
+        show_preview,
         project: str | None = None,
         location: str | None = None,
+        macro_description: str = "macro",
     ):
         """Helper function to manage semaphore acquisition/release."""
         async with semaphore:
             return await process_image(
-                image_path, output_path, hide_window, project, location
+                image_path, output_path, show_preview, project, location, macro_description
             )
 
     # --- Process each image file ---
@@ -696,7 +806,7 @@ async def main():
         # Create a task for each image
         task = asyncio.create_task(
             process_with_semaphore(
-                image_path, output_path, args.hide_window, args.project, args.location
+                image_path, output_path, args.show_preview, args.project, args.location, args.macro_description
             )
         )
         tasks.append(task)

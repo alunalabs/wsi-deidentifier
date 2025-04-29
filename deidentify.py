@@ -11,12 +11,18 @@ Usage Examples
 # Process slides using pre-identified bounding boxes
 uv run python deidentify.py "sample/identified/*.svs" --salt "your-secret-salt" --boxes-json identified_boxes.json
 
-# Default centered rectangle
+# Basic de-identification without modifying macro images
 uv run python deidentify.py "sample/identified/*.{svs,tif,tiff}" \\
     --salt "your-secret-salt-here" \\
     -o sample/deidentified \\
-    -m sample/hash_mapping.csv \\
-    --macro-description "macro"
+    -m sample/hash_mapping.csv
+
+# Default centered rectangle for macro masking
+uv run python deidentify.py "sample/identified/*.{svs,tif,tiff}" \\
+    --salt "your-secret-salt-here" \\
+    -o sample/deidentified \\
+    --macro-description "macro" \\
+    --rect 0 0 0 0
 
 # Specify custom rectangle coordinates (x0 y0 x1 y1)
 uv run python deidentify.py "path/to/slides/*.svs" \\
@@ -28,8 +34,8 @@ The script will:
 1. Copy input slides to a specified output directory
 2. Rename them using a salted hash derived from the original filename
 3. Remove the "label" image (which often contains PHI)
-4. Redact the "macro" image by masking areas containing PHI
-5. Strip non-technical metadata fields
+4. Strip non-technical metadata fields 
+5. Optionally redact the "macro" image by masking areas containing PHI (only if --rect or --boxes-json is specified)
 6. Generate a CSV mapping of original to hashed filenames
 """
 
@@ -211,25 +217,38 @@ def process_slide(
     delete_associated_image(dst, "label")
     strip_metadata(dst)
 
-    # Check if macro exists before trying to replace it
-    if check_macro_exists(dst, macro_description):
-        print(f"  Replacing macro ({macro_description}) in {dst}")
-        try:
-            replace_macro(
-                str(dst),
-                str(dst),
-                macro_description=macro_description,
-                rect_coords=rect_coords,
-            )
-        except Exception as e:
+    # Check if we should modify the macro image
+    if rect_coords is not None:
+        # Only modify the macro if rect_coords is specified (either from --rect or --boxes-json)
+        # Check if macro exists before trying to replace it
+        if check_macro_exists(dst, macro_description):
+            print(f"  Replacing macro ({macro_description}) in {dst}")
+            try:
+                # Convert from (x, y, width, height) format to (x0, y0, x1, y1) format if needed
+                if len(rect_coords) == 4:
+                    x, y, w, h = rect_coords
+                    # replace_macro.py expects (x0, y0, x1, y1) format where x1,y1 are coordinates, not width/height
+                    converted_coords = (x, y, x + w, y + h)
+                    print(f"  Converting coordinates from (x,y,w,h)={rect_coords} to (x0,y0,x1,y1)={converted_coords}")
+                    rect_coords = converted_coords
+                
+                replace_macro(
+                    str(dst),
+                    str(dst),
+                    macro_description=macro_description,
+                    rect_coords=rect_coords,
+                )
+            except Exception as e:
+                print(
+                    f"  Error replacing macro in {dst}: {e}",
+                    file=sys.stderr,
+                )
+        else:
             print(
-                f"  Error replacing macro in {dst}: {e}",
-                file=sys.stderr,
+                f"  Macro ({macro_description}) not found or inaccessible in {dst}, skipping replacement."
             )
     else:
-        print(
-            f"  Macro ({macro_description}) not found or inaccessible in {dst}, skipping replacement."
-        )
+        print(f"  No rectangle coordinates provided, keeping macro image unchanged.")
 
     writer.writerow(
         {
@@ -313,7 +332,12 @@ def main(argv=None):
                 expanded_patterns = [pattern]
 
             for exp_pattern in expanded_patterns:
-                for path in Path().glob(exp_pattern):
+                pattern_paths = list(Path().glob(exp_pattern))
+                if pattern_paths:
+                    print(f"  Found {len(pattern_paths)} files for pattern '{exp_pattern}'")
+                else:
+                    print(f"  No files found for pattern '{exp_pattern}'")
+                for path in pattern_paths:
                     all_paths.add(path)  # Collect unique paths
 
         print(f"Found {len(all_paths)} unique files to process.")
