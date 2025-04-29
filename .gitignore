@@ -176,3 +176,5 @@ cython_debug/
 debug_*.png
 boxes.json
 identified_boxes.json
+hash_mapping.csv
+deidentified/
