@@ -174,3 +174,5 @@ cython_debug/
 .pypirc
 
 debug_*.png
+boxes.json
+identified_boxes.json

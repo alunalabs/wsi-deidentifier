@@ -20,12 +20,12 @@ from gemini_extract import (
 
 # --- Usage Examples ---
 # Process a single image and display the result:
-# uv run python find_identifying_boxes.py ./sample/macro_images/GR24-4430_A_HE_M_78_macro.jpg
-# uv run python find_identifying_boxes.py ./sample/macro_images/GP17-009358_A_HE_macro.jpg
+# uv run python find_identifying_boxes.py ./sample/macro_images/test_macro_image.jpg
+# uv run python find_identifying_boxes.py ./sample/macro_images/test_macro_image.jpg
 #
 # Process a single image and save the annotated output:
-# uv run python find_identifying_boxes.py ./sample/macro_images/GR24-4430_A_HE_M_78_macro.jpg --output ./sample/macro_images_annotated/GR24-4430_A_HE_M_78_macro_annotated.jpg
-# uv run python find_identifying_boxes.py ./sample/macro_images/GP14-5551_A_HE_macro.jpg --output ./sample/macro_images_annotated/GP14-5551_A_HE_macro_annotated.jpg
+# uv run python find_identifying_boxes.py ./sample/macro_images/test_macro_image.jpg --output ./sample/macro_images_annotated/test_macro_image.jpg
+# uv run python find_identifying_boxes.py ./sample/macro_images/test_macro_image.jpg --output ./sample/macro_images_annotated/test_macro_image.jpg
 #
 # Process all JPG images in a directory and save annotated versions to another directory:
 # uv run python find_identifying_boxes.py ./sample/macro_images/*.jpg --output ./sample/macro_images_annotated/

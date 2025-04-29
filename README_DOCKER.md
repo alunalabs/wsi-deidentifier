@@ -31,7 +31,7 @@ For convenience, a wrapper script (`run_wsi_identifier.sh`) is provided to simpl
 
 ```bash
 # Build and run in one command
-./run_wsi_identifier.sh --build --input-path "./sample/macro_images/GP14-5551_A_HE_macro.jpg" --output-path "./sample/output.jpg"
+./run_wsi_identifier.sh --build --input-path "./sample/macro_images/test_macro_image.jpg" --output-path "./sample/output.jpg"
 
 # Process multiple images with a glob pattern
 ./run_wsi_identifier.sh --input-path "./sample/macro_images/*.jpg" --output-path "./sample/macro_images_annotated/"
@@ -60,9 +60,11 @@ For convenience, a wrapper script (`run_wsi_identifier.sh`) is provided to simpl
 The script automatically mounts Google Cloud credentials if they are available. For text detection functionality, set up authentication before using the container:
 
 1. **Application Default Credentials** (recommended):
+
    ```bash
    gcloud auth application-default login
    ```
+
    This will create credentials at `~/.config/gcloud/application_default_credentials.json` which will be automatically mounted by the script.
 
 2. **Service Account JSON**:
@@ -78,6 +80,7 @@ If no credentials are provided, the GCP Vision API features will not work, but b
 For tissue detection using Vertex AI (Gemini), you must specify a Google Cloud project:
 
 1. **Using command line arguments**:
+
    ```bash
    ./run_wsi_identifier.sh --project "your-gcp-project-id" --location "us-central1" --input-path "./sample/macro_images/*.jpg"
    ```

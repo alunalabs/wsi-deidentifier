@@ -23,7 +23,7 @@ show_help() {
   echo
   echo "Examples:"
   echo "  ./run_wsi_identifier.sh --input-path './sample/macro_images/*.jpg' --output-path './sample/macro_images_annotated/'"
-  echo "  ./run_wsi_identifier.sh --build --input-path './sample/macro_images/GP14-5551_A_HE_macro.jpg' --output-path './sample/output.jpg'"
+  echo "  ./run_wsi_identifier.sh --build --input-path './sample/macro_images/test_macro_image.jpg' --output-path './sample/output.jpg'"
   echo "  ./run_wsi_identifier.sh --project 'my-gcp-project' --input-path './sample/macro_images/*.jpg' --output-path './sample/output/'"
   echo
   echo "Note: GCP authentication is required. Make sure to set GOOGLE_APPLICATION_CREDENTIALS"

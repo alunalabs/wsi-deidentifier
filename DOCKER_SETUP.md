@@ -5,6 +5,7 @@ This document summarizes the Docker setup created for the WSI De-identifier proj
 ## Files Created
 
 1. **Dockerfile**
+
    - Based on Python 3.10-slim
    - Installs required system dependencies (libzbar0, libdmtx0b, libgl1)
    - Uses uv for dependency management (installed via astral.sh install script)
@@ -12,6 +13,7 @@ This document summarizes the Docker setup created for the WSI De-identifier proj
    - Sets up file structure for input/output
 
 2. **run_wsi_identifier.sh**
+
    - Wrapper script for running the Docker container
    - Handles various command-line options including:
      - Input/output paths
@@ -29,6 +31,7 @@ This document summarizes the Docker setup created for the WSI De-identifier proj
 ### Authentication Support
 
 - **Google Cloud Vision API**
+
   - Automatically mounts application default credentials or service account JSON
   - Required for text detection in images
 
@@ -46,15 +49,17 @@ This document summarizes the Docker setup created for the WSI De-identifier proj
 ## Quick Start
 
 1. Build the Docker image:
+
    ```bash
    docker build -t wsi-deidentifier:latest .
    ```
 
 2. Setup authentication:
+
    ```bash
    # For Google Cloud Vision and Vertex AI
    gcloud auth application-default login
-   
+
    # Set required environment variables
    export GOOGLE_CLOUD_PROJECT="your-gcp-project-id"
    ```
@@ -62,7 +67,7 @@ This document summarizes the Docker setup created for the WSI De-identifier proj
 3. Run the tool:
    ```bash
    ./run_wsi_identifier.sh \
-     --input-path "./sample/macro_images/GP14-5551_A_HE_macro.jpg" \
+     --input-path "./sample/macro_images/test_macro_image.jpg" \
      --output-path "./sample/output/annotated.jpg" \
      --project "your-gcp-project-id" \
      --hide-window
