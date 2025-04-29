@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# process_slides.py
+
 import argparse
 import csv
 import hashlib
@@ -12,15 +14,16 @@ import cv2
 import numpy as np
 from io import BytesIO
 from PIL import Image
+import fitz  # PyMuPDF – used for true PDF redaction
 
 import tiffparser
 from replace_macro import replace_macro
-from PyPDF2 import PdfReader, PdfWriter
+from PyPDF2 import PdfReader
 from find_identifying_boxes import find_barcodes, find_text_boxes, process_image
 
 
 ###############################################################################
-# helpers
+# helpers (TIFF)
 ###############################################################################
 def delete_associated_image(slide_path: Path, image_type: str) -> None:
     allowed = {"label", "macro"}
@@ -120,9 +123,9 @@ def strip_metadata(path: Path) -> None:
             redacted = _sanitize(orig)
             if orig == redacted:
                 continue
-            data = redacted.encode()  # ASCII
+            data = redacted.encode()
             pad = tag.count - len(data)
-            if pad < 0:  # very rare – truncate
+            if pad < 0:
                 data = data[: tag.count]
                 pad = 0
             fp.seek(tag.valueoffset)
@@ -131,153 +134,108 @@ def strip_metadata(path: Path) -> None:
                 fp.write(b"\0" * pad)
 
 
-def extract_images_from_pdf(pdf_path: Path) -> list[tuple[Image.Image, tuple[int, int, int, int]]]:
-    """Extract images from a PDF along with their positions."""
+###############################################################################
+# PDF helpers
+###############################################################################
+def extract_images_from_pdf(
+    pdf_path: Path,
+) -> list[tuple[int, Image.Image, tuple[int, int, int, int]]]:
     reader = PdfReader(str(pdf_path))
-    images = []
-    
+    out: list[tuple[int, Image.Image, tuple[int, int, int, int]]] = []
+
     for page_num, page in enumerate(reader.pages):
-        if '/XObject' in page['/Resources']:
-            xObject = page['/Resources']['/XObject'].get_object()
-            
-            for obj in xObject:
-                if xObject[obj]['/Subtype'] == '/Image':
-                    # Get image data
-                    if xObject[obj]['/Filter'] == '/FlateDecode':
-                        data = xObject[obj].get_data()
-                        img = Image.open(BytesIO(data))
-                        # Get image position
-                        bbox = xObject[obj]['/BBox']
-                        images.append((img, bbox))
-    
-    return images
+        res = page.get("/Resources")
+        if "/XObject" not in res:
+            continue
+        x_objects = res["/XObject"].get_object()
+        for obj in x_objects.values():
+            if obj.get("/Subtype") != "/Image":
+                continue
+            if obj.get("/Filter") == "/FlateDecode":
+                img = Image.open(BytesIO(obj.get_data()))
+                bbox = obj["/BBox"]  # [llx, lly, urx, ury]
+                out.append((page_num, img, bbox))
 
-def process_pdf_images(pdf_path: Path) -> list[tuple[int, int, int, int]]:
-    """Process images in a PDF to find PII regions."""
+    return out
+
+
+def process_pdf_images(pdf_path: Path) -> list[tuple[int, int, int, int, int]]:
     images = extract_images_from_pdf(pdf_path)
-    pii_regions = []
-    
-    for img, bbox in images:
-        # Convert PIL Image to OpenCV format
+    regions: list[tuple[int, int, int, int, int]] = []
+
+    for page_num, img, bbox in images:
         cv_img = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
-        
-        # Find barcodes
-        barcode_boxes = find_barcodes(cv_img)
-        
-        # Find text regions
-        # Save image temporarily for GCP Vision
-        temp_path = Path("temp_image.jpg")
-        img.save(temp_path)
-        text_boxes = find_text_boxes(str(temp_path))
-        temp_path.unlink()
-        
-        # Process with Gemini for PII detection
-        # Note: This would need to be adapted to work with the image directly
-        # For now, we'll use the barcode and text boxes as PII regions
-        for box in barcode_boxes:
-            x, y, w, h = box['rect']
-            # Convert to PDF coordinates
-            pdf_x = bbox[0] + x
-            pdf_y = bbox[1] + y
-            pii_regions.append((pdf_x, pdf_y, w, h))
-            
-        for box in text_boxes:
-            x, y, w, h = box
-            # Convert to PDF coordinates
-            pdf_x = bbox[0] + x
-            pdf_y = bbox[1] + y
-            pii_regions.append((pdf_x, pdf_y, w, h))
-    
-    return pii_regions
 
-def redact_pdf_regions(pdf_path: Path, regions: list[tuple[int, int, int, int]]) -> None:
-    """Redact identified PII regions in a PDF."""
-    reader = PdfReader(str(pdf_path))
-    writer = PdfWriter()
-    
-    for page in reader.pages:
-        # Create a new page with redactions
-        page = page.get_object()
-        
-        # Add redaction rectangles for each region
-        for x, y, w, h in regions:
-            # Create a redaction rectangle
-            page.merge_page({
-                '/Type': '/Annot',
-                '/Subtype': '/Redact',
-                '/Rect': [x, y, x + w, y + h],
-                '/OC': {
-                    '/Type': '/OCG',
-                    '/Name': 'Redaction',
-                    '/Usage': {
-                        '/View': {'/ViewState': 'OFF'},
-                        '/Print': {'/PrintState': 'OFF'},
-                    }
-                }
-            })
-        
-        writer.add_page(page)
-    
-    # Save the redacted PDF
-    with pdf_path.open('wb') as output_file:
-        writer.write(output_file)
+        for b in find_barcodes(cv_img):
+            x, y, w, h = b["rect"]
+            regions.append((page_num, bbox[0] + x, bbox[1] + y, w, h))
 
-def strip_pdf_metadata(path: Path) -> None:
-    """Strip metadata and redact PII from a PDF file."""
-    # First process images to find PII
-    print(f"Processing images in {path} for PII detection...")
-    pii_regions = process_pdf_images(path)
-    
-    if pii_regions:
-        print(f"Found {len(pii_regions)} PII regions to redact")
-        # Redact the identified regions
-        redact_pdf_regions(path, pii_regions)
-    else:
-        print("No PII regions found")
-    
-    # Remove metadata
-    reader = PdfReader(str(path))
-    writer = PdfWriter()
+        temp = Path("temp_img.jpg")
+        img.save(temp)
+        for x, y, w, h in find_text_boxes(str(temp)):
+            regions.append((page_num, bbox[0] + x, bbox[1] + y, w, h))
+        temp.unlink(missing_ok=True)
 
-    # Copy all pages
-    for page in reader.pages:
-        writer.add_page(page)
+    return regions
 
-    # Remove all metadata
-    writer.metadata = {}
 
-    # Save the new PDF
-    with path.open("wb") as output_file:
-        writer.write(output_file)
+def redact_pdf_regions(pdf_path: Path, regions: list[tuple[int, int, int, int, int]]) -> None:
+    if not regions:
+        # Still clear metadata
+        with fitz.open(pdf_path) as doc:
+            doc.set_metadata({})
+            doc.save(pdf_path, garbage=4, deflate=True)
+        return
+
+    # Group regions per page
+    page_map: dict[int, list[tuple[int, int, int, int]]] = {}
+    for page_idx, x, y, w, h in regions:
+        page_map.setdefault(page_idx, []).append((x, y, w, h))
+
+    tmp_path = pdf_path.with_suffix(".redacted.pdf")
+    with fitz.open(pdf_path) as doc:
+        for page_idx, rects in page_map.items():
+            page = doc[page_idx]
+            page_h = page.rect.height
+            for x, y, w, h in rects:
+                # convert PDF bottom-left coords → MuPDF top-left coords
+                x0 = x
+                y0 = page_h - (y + h)
+                x1 = x + w
+                y1 = page_h - y
+                page.add_redact_annot(fitz.Rect(x0, y0, x1, y1), fill=(0, 0, 0))
+            page.apply_redactions()  # images default to pixelise
+
+        doc.set_metadata({})
+        doc.save(tmp_path, garbage=4, deflate=True)
+
+    tmp_path.replace(pdf_path)
 
 
 ###############################################################################
-# Helper Functions (including new one)
+# CLI helpers
 ###############################################################################
 def check_macro_exists(file_path: Path, macro_description: str) -> bool:
-    """Checks if a macro image with the given description exists in the TIFF file."""
     try:
         with file_path.open("rb") as fp:
             t = tiffparser.TiffFile(fp)
             for page in t.pages:
                 desc_tag = page.tags.get("ImageDescription")
-                if desc_tag:
-                    desc = desc_tag.value
-                    if isinstance(desc, bytes):
-                        desc = desc.decode(errors="ignore")
-                    if macro_description.lower() in desc.lower():
-                        return True
+                if not desc_tag:
+                    continue
+                desc = desc_tag.value
+                if isinstance(desc, bytes):
+                    desc = desc.decode(errors="ignore")
+                if macro_description.lower() in desc.lower():
+                    return True
     except Exception as e:
-        print(
-            f"  Warning: Could not check for macro in {file_path}: {e}", file=sys.stderr
-        )
-        # If we can't check, assume it doesn't exist or is inaccessible
+        print(f"  Warning: Could not check for macro in {file_path}: {e}", file=sys.stderr)
         return False
     return False
 
 
 ###############################################################################
-# CLI
+# main processing
 ###############################################################################
 def hash_id(slide_id: str, salt: str) -> str:
     return hashlib.sha256((salt + slide_id).encode()).hexdigest()
@@ -291,7 +249,7 @@ def process_slide(
     macro_description: str,
     rect_coords: tuple[int, int, int, int] | None,
 ) -> None:
-    if src.suffix.lower() not in [".svs", ".tif", ".tiff", ".pdf"]:
+    if src.suffix.lower() not in {".svs", ".tif", ".tiff", ".pdf"}:
         return
     slide_id = src.stem
     hashed_id = hash_id(slide_id, salt)
@@ -300,15 +258,14 @@ def process_slide(
     dst.parent.mkdir(parents=True, exist_ok=True)
     shutil.copyfile(src, dst)
 
-    if src.suffix.lower() == ".pdf":
-        strip_pdf_metadata(dst)
+    if dst.suffix.lower() == ".pdf":
+        regions = process_pdf_images(dst)
+        redact_pdf_regions(dst, regions)
     else:
         delete_associated_image(dst, "label")
         strip_metadata(dst)
 
-        # Check if macro exists before trying to replace it
         if check_macro_exists(dst, macro_description):
-            print(f"  Replacing macro ({macro_description}) in {dst}")
             try:
                 replace_macro(
                     str(dst),
@@ -317,14 +274,9 @@ def process_slide(
                     rect_coords=rect_coords,
                 )
             except Exception as e:
-                print(
-                    f"  Error replacing macro in {dst}: {e}",
-                    file=sys.stderr,
-                )
+                print(f"  Error replacing macro in {dst}: {e}", file=sys.stderr)
         else:
-            print(
-                f"  Macro ({macro_description}) not found or inaccessible in {dst}, skipping replacement."
-            )
+            print(f"  Macro ({macro_description}) not found in {dst}, skipping.")
 
     writer.writerow(
         {
@@ -338,18 +290,19 @@ def process_slide(
 
 def main(argv=None):
     p = argparse.ArgumentParser(
-        description="Copy .svs, .tif, or .pdf files, strip label/macro images (for slides), scrub metadata, and rename using salted hash"
+        description=(
+            "Copy .svs, .tif, or .pdf files, scrub metadata, remove label/macro images "
+            "and fully redact PHI regions."
+        )
     )
-    p.add_argument(
-        "slides", nargs="+", help="paths or glob patterns to .svs, .tif, or .pdf files"
-    )
+    p.add_argument("slides", nargs="+", help="paths or glob patterns to slide/PDF files")
     p.add_argument("-o", "--out", default="deidentified", help="output directory")
     p.add_argument("--salt", required=True, help="secret salt")
     p.add_argument("-m", "--map", default="hash_mapping.csv", help="mapping CSV")
     p.add_argument(
         "--macro-description",
         default="macro",
-        help="String identifier for the macro image (default: 'macro'). Case-insensitive.",
+        help="String identifier for the macro image (case-insensitive).",
     )
     p.add_argument(
         "--rect",
@@ -357,7 +310,7 @@ def main(argv=None):
         type=int,
         nargs=4,
         default=None,
-        help="Coordinates [x0 y0 x1 y1] for the redaction rectangle (optional). Defaults to a centered rectangle of 1/4 image size.",
+        help="[x0 y0 x1 y1] replacement rectangle for macro images.",
     )
     args = p.parse_args(argv)
 
@@ -366,38 +319,25 @@ def main(argv=None):
 
     mapping_exists = Path(args.map).is_file()
     with open(args.map, "a", newline="") as fp:
-        writer = csv.DictWriter(
-            fp, fieldnames=["slide_id", "hashed_id", "src_path", "dst_path"]
-        )
+        writer = csv.DictWriter(fp, fieldnames=["slide_id", "hashed_id", "src_path", "dst_path"])
         if not mapping_exists:
             writer.writeheader()
 
-        all_paths = set()
+        all_paths: set[Path] = set()
         for pattern in args.slides:
-            print(f"Processing pattern: {pattern}")
-            expanded_patterns = []
-            # Basic brace expansion
-            match = re.match(r"(.*)\{(.*)\}(.*)", pattern)
-            if match:
-                base, exts_str, suffix = match.groups()
-                extensions = exts_str.split(",")
-                expanded_patterns = [f"{base}{ext}{suffix}" for ext in extensions]
-                print(f"  Expanded to: {expanded_patterns}")
-            else:  # No braces or malformed, use as is
-                expanded_patterns = [pattern]
-
-            for exp_pattern in expanded_patterns:
-                for path in Path().glob(exp_pattern):
-                    all_paths.add(path)  # Collect unique paths
-
-        print(f"Found {len(all_paths)} unique files to process.")
+            brace = re.match(r"(.*)\{(.*)\}(.*)", pattern)
+            if brace:
+                base, exts, suff = brace.groups()
+                for ext in exts.split(","):
+                    all_paths.update(Path().glob(f"{base}{ext}{suff}"))
+            else:
+                all_paths.update(Path().glob(pattern))
 
         if not all_paths:
-            print("No files found matching the provided patterns.")
-            return  # Exit early if no files found
+            print("No files found.")
+            return
 
-        for path in sorted(list(all_paths)):  # Process in sorted order
-            print(f"Processing path: {path}")
+        for path in sorted(all_paths):
             try:
                 process_slide(
                     path,
