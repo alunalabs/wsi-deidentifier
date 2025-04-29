@@ -78,41 +78,42 @@ def find_barcodes(image):
     pyzbar_duration = time.time() - pyzbar_start
     print(f"  pyzbar detection took: {pyzbar_duration:.4f} seconds")
 
-    print("  pylibdmtx detection started")
-    # --- Use pylibdmtx ---
-    dmtx_start = time.time()
-    try:
-        raise Exception("temp disable")
-        # pylibdmtx works best with grayscale images
-        gray_image = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-        dmtx_barcodes = dmtx_decode(gray_image)
-        for barcode in dmtx_barcodes:
-            # pylibdmtx gives corner points (polygon), calculate bounding box
-            x = barcode.rect.left
-            y = barcode.rect.top
-            w = barcode.rect.width
-            h = barcode.rect.height
-            barcode_type = "DATAMATRIX"  # pylibdmtx only detects DataMatrix
-            barcode_data = barcode.data.decode("utf-8")
-            # TODO: Add mechanism to avoid adding duplicate barcodes if detected by both libs
-            barcode_boxes.append(
-                {
-                    "rect": (x, y, w, h),
-                    "type": f"dmtx_{barcode_type}",
-                    "data": barcode_data,
-                }  # Prefix type
+    enable_dmtx = False
+    if enable_dmtx:
+        print("  pylibdmtx detection started")
+        # --- Use pylibdmtx ---
+        dmtx_start = time.time()
+        try:
+            # pylibdmtx works best with grayscale images
+            gray_image = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+            dmtx_barcodes = dmtx_decode(gray_image)
+            for barcode in dmtx_barcodes:
+                # pylibdmtx gives corner points (polygon), calculate bounding box
+                x = barcode.rect.left
+                y = barcode.rect.top
+                w = barcode.rect.width
+                h = barcode.rect.height
+                barcode_type = "DATAMATRIX"  # pylibdmtx only detects DataMatrix
+                barcode_data = barcode.data.decode("utf-8")
+                # TODO: Add mechanism to avoid adding duplicate barcodes if detected by both libs
+                barcode_boxes.append(
+                    {
+                        "rect": (x, y, w, h),
+                        "type": f"dmtx_{barcode_type}",
+                        "data": barcode_data,
+                    }  # Prefix type
+                )
+                # print(f"  - Found {barcode_type} (dmtx): {barcode_data} at {(x, y, w, h)}")
+        except ImportError:
+            # This might happen if pylibdmtx or its dependencies are not correctly installed
+            print(
+                "Warning: pylibdmtx library not found or not properly installed. Skipping DataMatrix detection.",
+                file=sys.stderr,
             )
-            # print(f"  - Found {barcode_type} (dmtx): {barcode_data} at {(x, y, w, h)}")
-    except ImportError:
-        # This might happen if pylibdmtx or its dependencies are not correctly installed
-        print(
-            "Warning: pylibdmtx library not found or not properly installed. Skipping DataMatrix detection.",
-            file=sys.stderr,
-        )
-    except Exception as e:
-        print(f"Error during pylibdmtx detection: {e}", file=sys.stderr)
-    dmtx_duration = time.time() - dmtx_start
-    print(f"  pylibdmtx detection took: {dmtx_duration:.4f} seconds")
+        except Exception as e:
+            print(f"Error during pylibdmtx detection: {e}", file=sys.stderr)
+        dmtx_duration = time.time() - dmtx_start
+        print(f"  pylibdmtx detection took: {dmtx_duration:.4f} seconds")
 
     total_duration = time.time() - start_time
     print(f"Total barcode detection took: {total_duration:.4f} seconds")
