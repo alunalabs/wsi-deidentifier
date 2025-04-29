@@ -27,6 +27,9 @@ import cv2
 from gcp_textract import detect_text
 from gemini_extract import gemini_extract
 
+# https://github.com/NaturalHistoryMuseum/pyzbar/issues/131
+# export DYLD_FALLBACK_LIBRARY_PATH=$(brew --prefix zbar)/lib/:$(brew --prefix libdmtx)/lib/
+
 
 async def process_slide(
     file_path,

@@ -1,6 +1,7 @@
 import argparse
 import asyncio
 import glob
+import json
 import os
 import sys
 import time
@@ -21,10 +22,8 @@ from gemini_extract import (
 # --- Usage Examples ---
 # Process a single image and display the result:
 # uv run python find_identifying_boxes.py ./sample/macro_images/test_macro_image.jpg
-# uv run python find_identifying_boxes.py ./sample/macro_images/test_macro_image.jpg
 #
 # Process a single image and save the annotated output:
-# uv run python find_identifying_boxes.py ./sample/macro_images/test_macro_image.jpg --output ./sample/macro_images_annotated/test_macro_image.jpg
 # uv run python find_identifying_boxes.py ./sample/macro_images/test_macro_image.jpg --output ./sample/macro_images_annotated/test_macro_image.jpg
 #
 # Process all JPG images in a directory and save annotated versions to another directory:
@@ -33,6 +32,15 @@ from gemini_extract import (
 #
 # Process multiple specific images and save annotated versions to a directory:
 # uv run python find_identifying_boxes.py ./sample/macro_images/img1.jpg ./sample/macro_images/img2.png --output ./sample/macro_images_annotated/
+#
+# Process images and save the identified bounding boxes to a JSON file (default: identified_boxes.json):
+# uv run python find_identifying_boxes.py ./sample/macro_images/*.jpg --output ./sample/macro_images_annotated/ --save-boxes-json
+#
+# Process images and save the identified bounding boxes to a custom JSON path:
+# uv run python find_identifying_boxes.py ./sample/macro_images/*.jpg --output ./sample/macro_images_annotated/ --boxes-json-path ./sample/boxes_data.json
+#
+# Save only the JSON file without generating annotated images:
+# uv run python find_identifying_boxes.py ./sample/macro_images/*.jpg --save-boxes-json
 # ---
 
 
@@ -290,7 +298,7 @@ async def process_image(
     load_duration = time.time() - load_start
     if image is None:
         print(f"Error: Could not load image from path: {image_path}", file=sys.stderr)
-        return False  # Indicate failure
+        return False, None  # Indicate failure and return None for box data
     print(f"  Image loaded. (Load time: {load_duration:.4f}s)")
 
     # Get image dimensions once
@@ -326,7 +334,7 @@ async def process_image(
         print(
             "  An unexpected error occurred during GCP text detection.", file=sys.stderr
         )
-        return False  # Indicate failure
+        return False, None  # Indicate failure and return None for box data
 
     # --- Tissue Detection (Gemini) ---
     print("  Finding tissue regions (using Gemini)...")
@@ -431,6 +439,17 @@ async def process_image(
     print(f"  Initial identifying boxes found: {len(initial_all_boxes)}")
     print(f"  Identifying boxes after tissue filter: {len(filtered_all_rects)}")
 
+    # Prepare box data for return/JSON
+    box_data = {
+        "file_path": str(os.path.abspath(image_path)),
+        "macro_path": str(os.path.abspath(image_path)),
+        "rect_coords": encompassing_box,
+        "individual_boxes": [
+            {"x": x, "y": y, "width": w, "height": h}
+            for x, y, w, h in filtered_all_rects
+        ],
+    }
+
     # --- Output / Display ---
     draw_start = time.time()
     output_image_generated = False
@@ -469,13 +488,13 @@ async def process_image(
                 f"  Error saving image to {output_path}. OpenCV error: {e}",
                 file=sys.stderr,
             )
-            return False  # Indicate failure
+            return False, None  # Indicate failure and return None for box data
         except Exception as e:
             print(
                 f"  An unexpected error occurred saving image to {output_path}: {e}",
                 file=sys.stderr,
             )
-            return False  # Indicate failure
+            return False, None  # Indicate failure and return None for box data
     elif output_image_generated and not hide_window:
         # Display the image if boxes were found, no output path given, and not hidden
         print("  Displaying image with detected boxes...")
@@ -496,7 +515,7 @@ async def process_image(
 
     process_duration = time.time() - process_start_time
     print(f"--- Finished processing {image_path} in {process_duration:.4f} seconds ---")
-    return True  # Indicate success
+    return True, box_data  # Return box data along with success indicator
 
 
 async def main():
@@ -534,6 +553,16 @@ async def main():
             "GOOGLE_CLOUD_LOCATION", "us-central1"
         ),  # Try env var, fallback to us-central1
     )
+    parser.add_argument(
+        "--save-boxes-json",
+        action="store_true",
+        help="Save identified bounding boxes to a JSON file (identified_boxes.json) in the same directory as the output images.",
+    )
+    parser.add_argument(
+        "--boxes-json-path",
+        help="Custom path for the output JSON file with identified boxes. If not specified, the default is identified_boxes.json in the same directory as the output images.",
+        default=None,
+    )
 
     args = parser.parse_args()
 
@@ -570,6 +599,21 @@ async def main():
                 os.makedirs(output_dir, exist_ok=True)
             print(f"Output file set to: {args.output}")
 
+    # --- Determine JSON output path ---
+    json_output_path = None
+    if args.save_boxes_json or args.boxes_json_path:
+        if args.boxes_json_path:
+            json_output_path = args.boxes_json_path
+            # Ensure json directory exists
+            json_dir = os.path.dirname(json_output_path)
+            if json_dir:
+                os.makedirs(json_dir, exist_ok=True)
+        else:
+            # Always use the root directory regardless of output path
+            json_output_path = "identified_boxes.json"
+        
+        print(f"JSON output path set to: {json_output_path}")
+
     # --- GCP Authentication Check (only once) ---
     creds_env = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
     default_creds_path = os.path.expanduser(
@@ -595,6 +639,7 @@ async def main():
     failed_count = 0
     tasks = []
     semaphore = asyncio.Semaphore(10)  # Limit concurrency
+    box_data_results = []  # Collect box data for JSON output
 
     async def process_with_semaphore(
         image_path,
@@ -642,21 +687,42 @@ async def main():
     # --- Wait for all tasks to complete and gather results ---
     results = await asyncio.gather(*tasks, return_exceptions=True)
 
-    # --- Count successes and failures ---
+    # --- Process results and collect box data ---
     for result in results:
         if isinstance(result, Exception):
             print(f"An error occurred during processing: {result}", file=sys.stderr)
             failed_count += 1
-        elif result is True:  # process_image returns True on success
-            processed_count += 1
-        else:  # process_image returned False or something unexpected
+        elif isinstance(result, tuple) and len(result) == 2:
+            success, box_data = result
+            if success:
+                processed_count += 1
+                if box_data and (args.save_boxes_json or args.boxes_json_path):
+                    box_data_results.append(box_data)
+            else:
+                failed_count += 1
+        else:  # Unexpected result format
+            print(f"Unexpected result format: {result}", file=sys.stderr)
             failed_count += 1
+
+    # --- Save box data to JSON if requested ---
+    if json_output_path and box_data_results:
+        print(f"Saving {len(box_data_results)} bounding box entries to {json_output_path}")
+        try:
+            with open(json_output_path, 'w') as json_file:
+                json.dump(box_data_results, json_file, indent=2)
+            print(f"Successfully saved bounding box data to {json_output_path}")
+        except Exception as e:
+            print(f"Error saving JSON file: {e}", file=sys.stderr)
+    elif json_output_path:
+        print("No valid bounding box data to save to JSON file.")
 
     # --- Summary ---
     total_duration = time.time() - total_start_time
     print("\n--- Processing Complete ---")
     print(f"Successfully processed: {processed_count} image(s)")
     print(f"Failed to process:    {failed_count} image(s)")
+    if json_output_path and box_data_results:
+        print(f"Saved bounding boxes for {len(box_data_results)} image(s) to {json_output_path}")
     print(f"Total script execution time: {total_duration:.4f} seconds")
 
 
