@@ -1,6 +1,3 @@
-# To run this code you need to install the following dependencies:
-# pip install google-genai
-
 import argparse
 import json
 import os

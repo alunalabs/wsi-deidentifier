@@ -36,9 +36,6 @@ from gemini_extract import (  # Import from gemini script
 # ---
 
 
-# --- Helper Functions ---
-
-
 def check_intersection(
     box1: tuple[int, int, int, int], box2: tuple[int, int, int, int]
 ) -> bool:
@@ -74,9 +71,8 @@ def find_barcodes(image):
                     "rect": (x, y, w, h),
                     "type": f"pyzbar_{barcode_type}",
                     "data": barcode_data,
-                }  # Prefix type
+                }
             )
-            # print(f"  - Found {barcode_type} (pyzbar): {barcode_data} at {(x, y, w, h)}")
     except Exception as e:
         print(f"Error during pyzbar detection: {e}", file=sys.stderr)
     pyzbar_duration = time.time() - pyzbar_start
@@ -86,7 +82,7 @@ def find_barcodes(image):
     # --- Use pylibdmtx ---
     dmtx_start = time.time()
     try:
-        raise "temp disable"
+        raise Exception("temp disable")
         # pylibdmtx works best with grayscale images
         gray_image = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
         dmtx_barcodes = dmtx_decode(gray_image)
