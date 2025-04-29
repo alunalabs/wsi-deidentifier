@@ -13,6 +13,7 @@ dependencies = [
   "openslide-python>=1.4.1",
   "pillow>=11.2.1",
   "pylibdmtx>=0.1.10",
+  "pyside6>=6.9.0",
   "pytesseract>=0.3.13",
   "pyzbar>=0.1.9",
   "tifffile>=2025.3.30",

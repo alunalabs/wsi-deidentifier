@@ -1,0 +1,14 @@
+{
+  "slide_id": "CMU-1",
+  "hashed_id": "5718e29557f3e2e6fa2e5751ea76e25e029444359b21749546767b994abbe33d",
+  "original_path": "/Users/lawrencechen/fun/wsi-deidentifier/sample/identified/CMU-1.svs",
+  "macro_description_found": "macro",
+  "annotations": [
+    [
+      99,
+      27,
+      358,
+      436
+    ]
+  ]
+}

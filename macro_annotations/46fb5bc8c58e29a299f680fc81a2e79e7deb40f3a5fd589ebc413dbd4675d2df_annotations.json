@@ -1,0 +1,14 @@
+{
+  "slide_id": "GP23-012345A123",
+  "hashed_id": "46fb5bc8c58e29a299f680fc81a2e79e7deb40f3a5fd589ebc413dbd4675d2df",
+  "original_path": "/Users/lawrencechen/fun/wsi-deidentifier/sample/identified/GP23-012345A123.tif",
+  "macro_description_found": "macro",
+  "annotations": [
+    [
+      1328,
+      25,
+      1625,
+      744
+    ]
+  ]
+}

@@ -3,40 +3,41 @@
 De-identifies Whole Slide Image (WSI) files by removing PHI from metadata and macro images.
 
 This script processes WSI files (.svs, .tif, .tiff) to remove potentially identifying information.
-It can work with pre-identified bounding boxes from identify_boxes.py or use default/specified
-rectangles for masking.
+It can work with pre-identified bounding boxes from identify_boxes.py, use default/specified
+rectangles for masking, or launch an interactive UI for drawing bounding boxes.
 
 Usage Examples
 -------------
-# Process slides using pre-identified bounding boxes
+# Process slides using pre-identified bounding boxes (from JSON)
+# (Draws black boxes on macro based on JSON coords)
 uv run python deidentify.py "sample/identified/*.svs" --salt "your-secret-salt" --boxes-json identified_boxes.json
 
-# Basic de-identification without modifying macro images
-uv run python deidentify.py "sample/identified/*.{svs,tif,tiff}" \\
-    --salt "your-secret-salt-here" \\
-    -o sample/deidentified \\
+# Process slides using interactive annotation
+# (Pops up UI for each slide with a macro, saves annotations)
+uv run python deidentify.py "sample/identified/*.svs" --salt "your-secret-salt" --interactive-annotate --annotations-out-dir ./macro_annotations
+
+# Process slides using a single fixed rectangle for all macros
+# (Draws the same black box on all found macros)
+uv run python deidentify.py "path/to/slides/*.svs" --salt "your-secret-salt" -o output_dir --rect 100 150 500 600
+
+# Basic de-identification without modifying macro images at all
+# (Skips macro finding and replacement)
+uv run python deidentify.py "sample/identified/*.{svs,tif,tiff}" \
+    --salt "your-secret-salt-here" \
+    -o sample/deidentified \
     -m sample/hash_mapping.csv
 
-# Default centered rectangle for macro masking
-uv run python deidentify.py "sample/identified/*.{svs,tif,tiff}" \\
-    --salt "your-secret-salt-here" \\
-    -o sample/deidentified \\
-    --macro-description "macro" \\
-    --rect 0 0 0 0
-
-# Specify custom rectangle coordinates (x0 y0 x1 y1)
-uv run python deidentify.py "path/to/slides/*.svs" \\
-    --salt "your-secret-salt-here" \\
-    -o output_dir \\
-    --rect 100 150 500 600
+# Specify macro description preference order
+uv run python deidentify.py "*.svs" --salt "salt" --rect 0 0 1 1 --macro-description-prefs thumbnail macro overview
 
 The script will:
 1. Copy input slides to a specified output directory
 2. Rename them using a salted hash derived from the original filename
 3. Remove the "label" image (which often contains PHI)
-4. Strip non-technical metadata fields 
-5. Optionally redact the "macro" image by masking areas containing PHI (only if --rect or --boxes-json is specified)
-6. Generate a CSV mapping of original to hashed filenames
+4. Strip non-technical metadata fields (Optional, currently commented out)
+5. Optionally redact the "macro" image by masking areas containing PHI using one of the specified methods (--interactive-annotate, --boxes-json, --rect).
+6. If using interactive mode, save original macros and annotation coordinates.
+7. Generate a CSV mapping of original to hashed filenames
 """
 
 import argparse
@@ -49,8 +50,19 @@ import struct
 import sys
 from pathlib import Path
 
+from PIL import ImageDraw
+
 import tiffparser
-from replace_macro import replace_macro
+
+# Import the interactive UI runner function
+from interactive_annotator import run_annotator
+
+# Import necessary functions from refactored replace_macro.py
+from replace_macro import (
+    COMMON_MACRO_DESCRIPTIONS,
+    find_and_load_macro_openslide,
+    replace_macro_with_image,
+)
 
 
 ###############################################################################
@@ -168,26 +180,7 @@ def strip_metadata(path: Path) -> None:
 ###############################################################################
 # Helper Functions (including new one)
 ###############################################################################
-def check_macro_exists(src_file_path: Path, macro_description: str) -> bool:
-    """Checks if a macro image with the given description exists in the original TIFF file."""
-    try:
-        with src_file_path.open("rb") as fp:
-            t = tiffparser.TiffFile(fp)
-            for page in t.pages:
-                desc_tag = page.tags.get("ImageDescription")
-                if desc_tag:
-                    desc = desc_tag.value
-                    if isinstance(desc, bytes):
-                        desc = desc.decode(errors="ignore")
-                    if macro_description.lower() in desc.lower():
-                        return True
-    except Exception as e:
-        print(
-            f"  Warning: Could not reliably check for macro in source {src_file_path}: {e}",
-            file=sys.stderr,
-        )
-        return False
-    return False
+# Removed check_macro_exists - logic is now in find_and_load_macro_openslide
 
 
 ###############################################################################
@@ -202,42 +195,170 @@ def process_slide(
     out_dir: Path,
     salt: str,
     writer,
-    macro_description: str,
-    rect_coords: tuple[int, int, int, int] | None,
+    macro_annotation_mode: str | None,  # 'interactive', 'json', 'rect', or None
+    macro_description_prefs: list[str],
+    rect_coords_arg: tuple[int, int, int, int] | None,
+    boxes_json_data: dict[
+        str, list[tuple[int, int, int, int]]
+    ],  # Map path_str to list of rects
+    annotations_out_dir: Path | None,
 ) -> None:
     if src.suffix.lower() not in [".svs", ".tif", ".tiff"]:
         return
     slide_id = src.stem
     hashed_id = hash_id(slide_id, salt)
     dst = out_dir / f"{hashed_id}{src.suffix.lower()}"
+    src_str = str(src.resolve())  # Use resolved path for lookups
 
     dst.parent.mkdir(parents=True, exist_ok=True)
 
-    macro_exists_in_source = False
-    if rect_coords is not None:
-        macro_exists_in_source = check_macro_exists(src, macro_description)
-        if macro_exists_in_source:
-            print(
-                f"  Found macro ('{macro_description}') in source file {src}. Will attempt replacement after copy."
-            )
-        else:
-            print(
-                f"  Macro ('{macro_description}') not found or check failed in source file {src}. Skipping replacement."
-            )
+    # --- Macro Handling Setup ---
+    original_macro_pil = None
+    found_macro_desc = None
+    modified_macro_pil = None
+    rects_to_apply = []  # List of (x0, y0, x1, y1) tuples
 
+    # Only try loading macro if an annotation mode is active
+    if macro_annotation_mode:
+        print(f"  Attempting to load macro for {src}...", end="")
+        original_macro_pil, found_macro_desc = find_and_load_macro_openslide(
+            str(src), macro_description_prefs
+        )
+        if original_macro_pil and found_macro_desc:
+            print(f" Found ('{found_macro_desc}')")
+            # Keep a copy for modification
+            modified_macro_pil = original_macro_pil.copy()
+            # Ensure it's RGB for drawing
+            if modified_macro_pil.mode != "RGB":
+                modified_macro_pil = modified_macro_pil.convert("RGB")
+        else:
+            print(" Not found or load failed.")
+            # If macro not found, we can skip annotation steps for this file
+            macro_annotation_mode = None  # Disable further macro processing
+
+    # --- Copy and Initial De-identification ---
+    # Copy first, then modify the destination
+    print(f"  Copying {src} to {dst}...")
     shutil.copyfile(src, dst)
 
-    delete_associated_image(dst, "label")
-    # strip_metadata(dst)
+    print(f"  Deleting label image from {dst}...")
+    try:
+        delete_associated_image(dst, "label")
+    except Exception as e:
+        print(
+            f"  Warning: Failed to delete label image from {dst}: {e}", file=sys.stderr
+        )
 
-    if rect_coords is not None and macro_exists_in_source:
-        print(f"  Attempting macro replacement ({macro_description}) in {dst}")
+    # print(f"  Stripping metadata from {dst}...")
+    # try:
+    #     strip_metadata(dst)
+    # except Exception as e:
+    #     print(f"  Warning: Failed to strip metadata from {dst}: {e}", file=sys.stderr)
+
+    # --- Macro Annotation/Redaction ---
+    if macro_annotation_mode == "interactive" and modified_macro_pil:
+        if not annotations_out_dir:
+            print(
+                "  Error: --annotations-out-dir is required for --interactive-annotate",
+                file=sys.stderr,
+            )
+            # Decide how to handle this - skip annotation? Exit?
+            # For now, skip annotation for this file.
+            macro_annotation_mode = None
+        else:
+            annotations_out_dir.mkdir(parents=True, exist_ok=True)
+            # Save original macro
+            original_macro_path = (
+                annotations_out_dir / f"{hashed_id}_macro_original.png"
+            )
+            print(f"  Saving original macro to {original_macro_path}...")
+            try:
+                original_macro_pil.save(original_macro_path, "PNG")
+            except Exception as e:
+                print(f"  Warning: Failed to save original macro: {e}", file=sys.stderr)
+
+            # Launch interactive annotator
+            print(f"  Launching interactive annotator for {src}...")
+            # Call the runner function which handles the QApplication loop
+            saved_rects = run_annotator(modified_macro_pil)
+            # The run_annotator function blocks until the window is closed,
+            # and returns the results (or None if cancelled).
+
+            if saved_rects is not None:  # User saved, not cancelled
+                rects_to_apply = saved_rects
+                # Save annotations to JSON
+                annotation_json_path = (
+                    annotations_out_dir / f"{hashed_id}_annotations.json"
+                )
+                print(
+                    f"  Saving {len(rects_to_apply)} annotations to {annotation_json_path}..."
+                )
+                annotation_data = {
+                    "slide_id": slide_id,
+                    "hashed_id": hashed_id,
+                    "original_path": src_str,
+                    "macro_description_found": found_macro_desc,
+                    "annotations": rects_to_apply,
+                }
+                try:
+                    with open(annotation_json_path, "w") as f_json:
+                        json.dump(annotation_data, f_json, indent=2)
+                except Exception as e:
+                    print(
+                        f"  Warning: Failed to save annotation JSON: {e}",
+                        file=sys.stderr,
+                    )
+            else:
+                print("  Annotation cancelled by user.")
+                macro_annotation_mode = None  # Don't proceed with replacement
+
+    elif macro_annotation_mode == "json" and modified_macro_pil:
+        if src_str in boxes_json_data:
+            rects_to_apply = boxes_json_data[src_str]
+            print(f"  Using {len(rects_to_apply)} bounding box(es) from JSON for {src}")
+        else:
+            print(
+                f"  No bounding box found in JSON for {src}. Skipping macro replacement."
+            )
+            macro_annotation_mode = None
+
+    elif macro_annotation_mode == "rect" and modified_macro_pil:
+        if rect_coords_arg:
+            # Use the single rectangle provided via CLI arg
+            rects_to_apply = [rect_coords_arg]
+            print(f"  Using command-line rectangle {rect_coords_arg} for {src}")
+        else:
+            # Should not happen if mode is 'rect', but handle defensively
+            print(
+                "  Error: Macro mode is 'rect' but no --rect argument provided? Skipping.",
+                file=sys.stderr,
+            )
+            macro_annotation_mode = None
+
+    # --- Apply Rectangles and Replace Macro (if applicable) ---
+    if (
+        macro_annotation_mode
+        and rects_to_apply
+        and modified_macro_pil
+        and found_macro_desc
+    ):
+        print(f"  Drawing {len(rects_to_apply)} black rectangle(s) on macro...")
+        draw = ImageDraw.Draw(modified_macro_pil)
+        for x0, y0, x1, y1 in rects_to_apply:
+            # Ensure coords are int and ordered correctly
+            ix0, ix1 = sorted((int(x0), int(x1)))
+            iy0, iy1 = sorted((int(y0), int(y1)))
+            # Draw rectangle (fill is black)
+            draw.rectangle([ix0, iy0, ix1, iy1], fill=(0, 0, 0))
+
+        print(f"  Replacing macro image in {dst}...")
         try:
-            replace_macro(
-                str(dst),
-                str(dst),
-                macro_description=macro_description,
-                rect_coords=rect_coords,
+            replace_macro_with_image(
+                str(dst),  # Operate on the destination file
+                str(dst),  # Output path is the same (overwrite)
+                modified_macro_pil,  # The image with boxes drawn
+                found_macro_desc,  # The description string used to find the IFD
+                verbose=False,  # Or pass verbosity from args if needed
             )
             print(f"  Successfully replaced macro in {dst}.")
         except Exception as e:
@@ -245,13 +366,16 @@ def process_slide(
                 f"  Error during macro replacement in {dst}: {e}",
                 file=sys.stderr,
             )
-    elif rect_coords is not None and not macro_exists_in_source:
-        pass
-    else:
+    elif macro_annotation_mode:
+        # Handles cases where mode was set but no rects were generated
+        # (e.g., interactive cancelled, JSON key missing, rect arg missing)
         print(
-            "  No rectangle coordinates provided or macro not found in source, keeping macro image unchanged."
+            f"  Skipping macro replacement for {dst} (no valid annotations found/provided)."
         )
+    else:
+        print(f"  Macro image will not be modified for {dst}.")
 
+    # --- Finalize ---
     writer.writerow(
         {
             "slide_id": slide_id,
@@ -273,9 +397,10 @@ def main(argv=None):
     p.add_argument("--salt", required=True, help="secret salt")
     p.add_argument("-m", "--map", default="hash_mapping.csv", help="mapping CSV")
     p.add_argument(
-        "--macro-description",
-        default="macro",
-        help="String identifier for the macro image (default: 'macro'). Case-insensitive.",
+        "--macro-description-prefs",
+        nargs="+",
+        default=COMMON_MACRO_DESCRIPTIONS,
+        help=f"List of preferred macro description strings (default: {' '.join(COMMON_MACRO_DESCRIPTIONS)}). Case-insensitive.",
     )
     p.add_argument(
         "--rect",
@@ -289,29 +414,90 @@ def main(argv=None):
         "--boxes-json",
         help="Path to a JSON file containing pre-identified bounding boxes for each file. Generated by identify_boxes.py.",
     )
+    p.add_argument(
+        "--interactive-annotate",
+        action="store_true",
+        help="Launch an interactive UI for drawing bounding boxes on the macro image.",
+    )
+    p.add_argument(
+        "--annotations-out-dir",
+        default="./macro_annotations",
+        help="Directory to save original macros and annotation JSON files when using --interactive-annotate (default: ./macro_annotations)",
+    )
     args = p.parse_args(argv)
 
     out_dir = Path(args.out)
     out_dir.mkdir(exist_ok=True)
 
+    # --- Determine Macro Annotation Mode ---
+    macro_mode = None
+    if args.interactive_annotate:
+        if args.boxes_json or args.rect:
+            print(
+                "Warning: --interactive-annotate specified; ignoring --boxes-json and --rect.",
+                file=sys.stderr,
+            )
+        macro_mode = "interactive"
+        print("Macro annotation mode: Interactive")
+    elif args.boxes_json:
+        if args.rect:
+            print("Warning: --boxes-json specified; ignoring --rect.", file=sys.stderr)
+        macro_mode = "json"
+        print("Macro annotation mode: JSON Boxes")
+    elif args.rect:
+        macro_mode = "rect"
+        print(f"Macro annotation mode: Fixed Rectangle {args.rect}")
+    else:
+        print("Macro annotation mode: None (macros will not be modified)")
+
+    # --- Load Boxes JSON if needed ---
     boxes_by_path = {}
-    if args.boxes_json:
+    if macro_mode == "json":
         try:
             with open(args.boxes_json, "r") as f:
                 boxes_data = json.load(f)
+                # Expecting format: [{ "file_path": "...", "rect_coords": [x0,y0,x1,y1] }, ...]
+                # Convert to: { "resolved_file_path_str": [(x0,y0,x1,y1), ...], ... }
+                # Note: Original identify_boxes.py puts a single rect, adapting here to expect/store a list
+                count = 0
                 for item in boxes_data:
-                    file_path = item.get("file_path")
-                    rect_coords = item.get("rect_coords")
-                    if file_path and rect_coords:
-                        boxes_by_path[file_path] = tuple(rect_coords)
-                        print(f"Loaded bounding box for {file_path}: {rect_coords}")
-                print(
-                    f"Loaded bounding boxes for {len(boxes_by_path)} files from {args.boxes_json}"
-                )
+                    file_path_str = item.get("file_path")
+                    rect_coords = item.get("rect_coords")  # This is a single tuple
+                    if (
+                        file_path_str
+                        and isinstance(rect_coords, (list, tuple))
+                        and len(rect_coords) == 4
+                    ):
+                        resolved_path_str = str(Path(file_path_str).resolve())
+                        # Store as a list containing the single rectangle
+                        boxes_by_path[resolved_path_str] = [tuple(rect_coords)]
+                        count += 1
+                    else:
+                        print(
+                            f"Warning: Skipping invalid entry in {args.boxes_json}: {item}",
+                            file=sys.stderr,
+                        )
+                print(f"Loaded bounding boxes for {count} files from {args.boxes_json}")
+        except FileNotFoundError:
+            print(
+                f"Error: Boxes JSON file not found: {args.boxes_json}", file=sys.stderr
+            )
+            return 1  # Exit if JSON mode selected but file missing
         except Exception as e:
-            print(f"Error loading boxes JSON file: {e}", file=sys.stderr)
-            return
+            print(
+                f"Error loading or parsing boxes JSON file ({args.boxes_json}): {e}",
+                file=sys.stderr,
+            )
+            return 1  # Exit on other JSON errors
 
+    # --- Prepare Annotation Output Dir if needed ---
+    annotations_dir = None
+    if macro_mode == "interactive":
+        annotations_dir = Path(args.annotations_out_dir)
+        # The directory itself is created within process_slide if needed
+        print(f"Annotations and original macros will be saved to: {annotations_dir}")
+
+    # --- Process Slides ---
     mapping_exists = Path(args.map).is_file()
     with open(args.map, "a", newline="") as fp:
         writer = csv.DictWriter(
@@ -354,13 +540,8 @@ def main(argv=None):
             print(f"Processing path: {path}")
             path_str = str(path.resolve())
 
-            rect_coords = None
-            if path_str in boxes_by_path:
-                rect_coords = boxes_by_path[path_str]
-                print(f"Using pre-identified bounding box: {rect_coords}")
-            elif args.rect:
-                rect_coords = tuple(args.rect)
-                print(f"Using command-line rectangle: {rect_coords}")
+            # Determine rectangle source for this specific file
+            # This logic is now handled inside process_slide based on macro_mode
 
             try:
                 process_slide(
@@ -368,8 +549,11 @@ def main(argv=None):
                     out_dir,
                     args.salt,
                     writer,
-                    args.macro_description,
-                    rect_coords,
+                    macro_mode,  # Pass the determined mode
+                    args.macro_description_prefs,
+                    tuple(args.rect) if args.rect else None,
+                    boxes_by_path,  # Pass the loaded JSON data
+                    annotations_dir,  # Pass the output dir for interactive mode
                 )
                 print(f"✓ {path} → {out_dir}")
             except Exception as e:
