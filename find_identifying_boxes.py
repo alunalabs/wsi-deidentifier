@@ -11,7 +11,7 @@ from pylibdmtx.pylibdmtx import decode as dmtx_decode
 from pyzbar import pyzbar
 
 from gcp_textract import detect_text
-from gemini_extract import (  # Import from gemini script
+from gemini_extract import (
     gemini_extract,
 )
 
