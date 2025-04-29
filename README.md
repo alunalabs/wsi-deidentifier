@@ -9,6 +9,21 @@ This tool processes Whole Slide Image (WSI) files (`.svs`, `.tif`, `.tiff`) to r
 5.  **Strips** non-technical metadata fields from the TIFF image description tag.
 6.  **Generates** a CSV mapping file (`hash_mapping.csv` by default) to link original filenames to their hashed counterparts and track file paths.
 
+In Step 4, we can also use Gemini to detect identifying boxes in the macro image. However, this is not yet fully integrated.
+
+# Quick Start with Docker
+
+```bash
+# First, run the script to process the SVS files
+./run_wsi_identifier.sh --project MY_GCP_PROJECT --input-path './sample/macro_images/*.jpg' --output-path './sample/output/' --build
+```
+
+# Installation
+
+```bash
+uv sync
+```
+
 # Usage
 
 ```bash

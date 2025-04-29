@@ -128,7 +128,8 @@ elif [ -f "$HOME/.config/gcloud/application_default_credentials.json" ]; then
   # Create a clean copy of credentials to mount
   mkdir -p /tmp/gcloud_config/.config
   cp -r "$HOME/.config/gcloud" /tmp/gcloud_config/.config/
-  DOCKER_CMD="$DOCKER_CMD -v /tmp/gcloud_config/.config:/root/.config:ro"
+  # Mount with read/write permissions for potential token refresh
+  DOCKER_CMD="$DOCKER_CMD -v /tmp/gcloud_config/.config:/root/.config"
 else
   echo "Warning: No Google Cloud credentials found. Text detection using GCP Vision API will not work."
   echo "Run 'gcloud auth application-default login' or set GOOGLE_APPLICATION_CREDENTIALS."
@@ -180,7 +181,8 @@ fi
 
 # Run the Docker container
 echo "Running WSI identifier..."
-$DOCKER_CMD wsi-deidentifier:latest "/data/input/$INPUT_BASE" $OUTPUT_ARG
+echo "Executing: $DOCKER_CMD wsi-deidentifier:latest \"/data/input/$INPUT_BASE\" $OUTPUT_ARG"
+eval $DOCKER_CMD wsi-deidentifier:latest "/data/input/$INPUT_BASE" $OUTPUT_ARG
 
 # Clean up any temporary directories
 if [ -d "/tmp/gcloud_config" ]; then
