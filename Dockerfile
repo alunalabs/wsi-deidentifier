@@ -3,32 +3,37 @@ FROM python:3.10-slim
 # Set working directory
 WORKDIR /app
 
-# Install required dependencies
+# Install required system dependencies
 RUN apt-get update && apt-get install -y \
     libzbar0 \
     libdmtx0b \
     libgl1 \
+    curl \
+    ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
+# Install uv package manager
+RUN curl -LsSf https://astral.sh/uv/install.sh | sh
+
+# Add uv to PATH
+ENV PATH="/root/.local/bin:${PATH}"
+
 # Copy project files
-COPY pyproject.toml ./
+COPY pyproject.toml uv.lock* ./
 COPY *.py ./
 
-# Install Python dependencies directly
-RUN pip install --no-cache-dir \
-    google-cloud-vision>=3.10.1 \
-    google-genai>=1.12.1 \
-    opencv-python>=4.11.0.86 \
-    pillow>=11.2.1 \
-    pylibdmtx>=0.1.10 \
-    pytesseract>=0.3.13 \
-    pyzbar>=0.1.9 \
-    tifffile>=2025.3.30 \
-    tinynumpy>=1.2.1
+# Install Python dependencies using uv
+RUN uv sync
 
 # Create directories for processed files
 RUN mkdir -p /data/input /data/output
 
+# Create entry script to ensure virtual environment is activated
+RUN echo '#!/bin/bash\n\
+source .venv/bin/activate\n\
+python find_identifying_boxes.py "$@"' > /app/entrypoint.sh && \
+    chmod +x /app/entrypoint.sh
+
 # Default command
-ENTRYPOINT ["python", "find_identifying_boxes.py"]
+ENTRYPOINT ["/app/entrypoint.sh"]
 CMD ["--help"]

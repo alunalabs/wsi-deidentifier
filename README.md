@@ -24,6 +24,9 @@ uv run deidentify.py "path/to/slides/*.svs" \
     --salt "your-secret-salt-here" \
     -o output_dir \
     --rect 100 150 500 600
+
+export GOOGLE_CLOUD_PROJECT=**********
+uv run gemini_extract.py ./sample/macro_images/testing_extracted_macro.jpg
 ```
 
 # Options

@@ -7,7 +7,8 @@ This document summarizes the Docker setup created for the WSI De-identifier proj
 1. **Dockerfile**
    - Based on Python 3.10-slim
    - Installs required system dependencies (libzbar0, libdmtx0b, libgl1)
-   - Installs Python dependencies including Google Cloud Vision and Gemini
+   - Uses uv for dependency management (installed via astral.sh install script)
+   - Installs Python dependencies from pyproject.toml via `uv sync`
    - Sets up file structure for input/output
 
 2. **run_wsi_identifier.sh**
