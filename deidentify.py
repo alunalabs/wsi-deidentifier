@@ -14,7 +14,7 @@ import cv2
 import numpy as np
 from io import BytesIO
 from PIL import Image
-import fitz  # PyMuPDF – used for true PDF redaction
+import fitz 
 
 import tiffparser
 from replace_macro import replace_macro
