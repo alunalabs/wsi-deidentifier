@@ -168,10 +168,10 @@ def strip_metadata(path: Path) -> None:
 ###############################################################################
 # Helper Functions (including new one)
 ###############################################################################
-def check_macro_exists(file_path: Path, macro_description: str) -> bool:
-    """Checks if a macro image with the given description exists in the TIFF file."""
+def check_macro_exists(src_file_path: Path, macro_description: str) -> bool:
+    """Checks if a macro image with the given description exists in the original TIFF file."""
     try:
-        with file_path.open("rb") as fp:
+        with src_file_path.open("rb") as fp:
             t = tiffparser.TiffFile(fp)
             for page in t.pages:
                 desc_tag = page.tags.get("ImageDescription")
@@ -183,9 +183,9 @@ def check_macro_exists(file_path: Path, macro_description: str) -> bool:
                         return True
     except Exception as e:
         print(
-            f"  Warning: Could not check for macro in {file_path}: {e}", file=sys.stderr
+            f"  Warning: Could not reliably check for macro in source {src_file_path}: {e}",
+            file=sys.stderr,
         )
-        # If we can't check, assume it doesn't exist or is inaccessible
         return False
     return False
 
@@ -212,43 +212,45 @@ def process_slide(
     dst = out_dir / f"{hashed_id}{src.suffix.lower()}"
 
     dst.parent.mkdir(parents=True, exist_ok=True)
+
+    macro_exists_in_source = False
+    if rect_coords is not None:
+        macro_exists_in_source = check_macro_exists(src, macro_description)
+        if macro_exists_in_source:
+            print(
+                f"  Found macro ('{macro_description}') in source file {src}. Will attempt replacement after copy."
+            )
+        else:
+            print(
+                f"  Macro ('{macro_description}') not found or check failed in source file {src}. Skipping replacement."
+            )
+
     shutil.copyfile(src, dst)
 
     delete_associated_image(dst, "label")
-    strip_metadata(dst)
+    # strip_metadata(dst)
 
-    # Check if we should modify the macro image
-    if rect_coords is not None:
-        # Only modify the macro if rect_coords is specified (either from --rect or --boxes-json)
-        # Check if macro exists before trying to replace it
-        if check_macro_exists(dst, macro_description):
-            print(f"  Replacing macro ({macro_description}) in {dst}")
-            try:
-                # Convert from (x, y, width, height) format to (x0, y0, x1, y1) format if needed
-                if len(rect_coords) == 4:
-                    x, y, w, h = rect_coords
-                    # replace_macro.py expects (x0, y0, x1, y1) format where x1,y1 are coordinates, not width/height
-                    converted_coords = (x, y, x + w, y + h)
-                    print(f"  Converting coordinates from (x,y,w,h)={rect_coords} to (x0,y0,x1,y1)={converted_coords}")
-                    rect_coords = converted_coords
-                
-                replace_macro(
-                    str(dst),
-                    str(dst),
-                    macro_description=macro_description,
-                    rect_coords=rect_coords,
-                )
-            except Exception as e:
-                print(
-                    f"  Error replacing macro in {dst}: {e}",
-                    file=sys.stderr,
-                )
-        else:
-            print(
-                f"  Macro ({macro_description}) not found or inaccessible in {dst}, skipping replacement."
+    if rect_coords is not None and macro_exists_in_source:
+        print(f"  Attempting macro replacement ({macro_description}) in {dst}")
+        try:
+            replace_macro(
+                str(dst),
+                str(dst),
+                macro_description=macro_description,
+                rect_coords=rect_coords,
             )
+            print(f"  Successfully replaced macro in {dst}.")
+        except Exception as e:
+            print(
+                f"  Error during macro replacement in {dst}: {e}",
+                file=sys.stderr,
+            )
+    elif rect_coords is not None and not macro_exists_in_source:
+        pass
     else:
-        print(f"  No rectangle coordinates provided, keeping macro image unchanged.")
+        print(
+            "  No rectangle coordinates provided or macro not found in source, keeping macro image unchanged."
+        )
 
     writer.writerow(
         {
@@ -292,19 +294,20 @@ def main(argv=None):
     out_dir = Path(args.out)
     out_dir.mkdir(exist_ok=True)
 
-    # Load boxes JSON if provided
     boxes_by_path = {}
     if args.boxes_json:
         try:
-            with open(args.boxes_json, 'r') as f:
+            with open(args.boxes_json, "r") as f:
                 boxes_data = json.load(f)
                 for item in boxes_data:
-                    file_path = item.get('file_path')
-                    rect_coords = item.get('rect_coords')
+                    file_path = item.get("file_path")
+                    rect_coords = item.get("rect_coords")
                     if file_path and rect_coords:
                         boxes_by_path[file_path] = tuple(rect_coords)
                         print(f"Loaded bounding box for {file_path}: {rect_coords}")
-                print(f"Loaded bounding boxes for {len(boxes_by_path)} files from {args.boxes_json}")
+                print(
+                    f"Loaded bounding boxes for {len(boxes_by_path)} files from {args.boxes_json}"
+                )
         except Exception as e:
             print(f"Error loading boxes JSON file: {e}", file=sys.stderr)
             return
@@ -321,45 +324,44 @@ def main(argv=None):
         for pattern in args.slides:
             print(f"Processing pattern: {pattern}")
             expanded_patterns = []
-            # Basic brace expansion
             match = re.match(r"(.*)\{(.*)\}(.*)", pattern)
             if match:
                 base, exts_str, suffix = match.groups()
                 extensions = exts_str.split(",")
                 expanded_patterns = [f"{base}{ext}{suffix}" for ext in extensions]
                 print(f"  Expanded to: {expanded_patterns}")
-            else:  # No braces or malformed, use as is
+            else:
                 expanded_patterns = [pattern]
 
             for exp_pattern in expanded_patterns:
                 pattern_paths = list(Path().glob(exp_pattern))
                 if pattern_paths:
-                    print(f"  Found {len(pattern_paths)} files for pattern '{exp_pattern}'")
+                    print(
+                        f"  Found {len(pattern_paths)} files for pattern '{exp_pattern}'"
+                    )
                 else:
                     print(f"  No files found for pattern '{exp_pattern}'")
                 for path in pattern_paths:
-                    all_paths.add(path)  # Collect unique paths
+                    all_paths.add(path)
 
         print(f"Found {len(all_paths)} unique files to process.")
 
         if not all_paths:
             print("No files found matching the provided patterns.")
-            return  # Exit early if no files found
+            return
 
-        for path in sorted(list(all_paths)):  # Process in sorted order
+        for path in sorted(list(all_paths)):
             print(f"Processing path: {path}")
             path_str = str(path.resolve())
-            
-            # Check if we have a pre-identified bounding box for this file
+
             rect_coords = None
             if path_str in boxes_by_path:
                 rect_coords = boxes_by_path[path_str]
                 print(f"Using pre-identified bounding box: {rect_coords}")
             elif args.rect:
-                # Use the global rectangle if specified and no file-specific one found
                 rect_coords = tuple(args.rect)
                 print(f"Using command-line rectangle: {rect_coords}")
-            
+
             try:
                 process_slide(
                     path,

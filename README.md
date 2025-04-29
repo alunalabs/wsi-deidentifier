@@ -13,6 +13,10 @@ Example macro image with PHI bounding boxes and tissue regions:
 
 ![Example macro image with PHI bounding boxes and tissue regions](./assets/JP2K-33003-2_macro.png)
 
+Example macro image with red rectangle drawn over PHI:
+
+![Example macro image with red rectangle drawn over PHI](./assets/slide_in_qupath.png)
+
 # Quick Start with Docker
 
 ```bash
