@@ -178,3 +178,5 @@ boxes.json
 identified_boxes.json
 hash_mapping.csv
 deidentified/
+deidentified_repaired/
+macro_annotations/

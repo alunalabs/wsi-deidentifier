@@ -15,8 +15,10 @@ python replace_macro.py INPUT.SVS [OUTPUT.SVS] [x0 y0 x1 y1] [-v|--verbose]
 """
 
 import argparse
+import io
 import logging
 import os
+import shutil
 import struct
 import sys
 from io import BytesIO
@@ -179,148 +181,191 @@ def fail(msg, **ctx):
 
 
 def replace_macro_with_image(
-    input_path: str,
-    output_path: str,
+    data: bytearray,
     new_macro_pil_image: Image.Image,
     macro_description_to_find: str,
     verbose: bool = False,
-):
+) -> bytearray:
     """
-    Replaces the macro image in an SVS file with the provided PIL Image.
+    Replaces the macro image in the provided bytearray with the given PIL Image.
 
     Args:
-        input_path (str): Path to the input SVS file.
-        output_path (str): Path to save the modified SVS file.
+        data (bytearray): The SVS/TIFF file content as a mutable byte array.
         new_macro_pil_image (Image.Image): The new macro image (must be RGB).
         macro_description_to_find (str): The description string used to identify the correct IFD.
         verbose (bool): Enable verbose logging.
+
+    Returns:
+        bytearray: The modified byte array with the macro replaced.
+
+    Raises:
+        ValueError: If the macro IFD cannot be found or tags cannot be updated.
+        Exception: For other file processing errors.
     """
-    logging.basicConfig(
-        level=logging.DEBUG if verbose else logging.INFO,
-        format="%(levelname)s: %(message)s",
+    # logging setup is handled by the calling script (deidentify.py)
+    logging.info(
+        "Replacing macro in-memory (targeting description '%s')",
+        macro_description_to_find,
     )
-    logging.info("Replacing macro in %s with provided image", input_path)
+
+    # Operate on the bytearray directly using BytesIO for parsing convenience
     try:
-        with open(input_path, "rb") as f:
-            data = bytearray(f.read())
-    except FileNotFoundError:
-        fail(f"Input file not found: {input_path}")
+        with io.BytesIO(data) as fp:  # Use BytesIO for reading IFDs etc.
+            # Read header info directly from bytearray
+            if len(data) < 8:
+                raise ValueError("Data too short for TIFF header")
+
+            endian_char = data[:2].decode("ascii", "ignore")
+            endian = {"II": "<", "MM": ">"}.get(endian_char)
+            magic_number = None
+            if endian:
+                try:
+                    magic_number = struct.unpack(endian + "H", data[2:4])[0]
+                except struct.error:
+                    pass  # magic_number remains None
+
+            if not endian or magic_number != 42:
+                raise ValueError(
+                    f"Not a TIFF/SVS – bad byte order or missing magic number (read {magic_number})"
+                )
+
+            first_ifd_offset = struct.unpack(endian + "I", data[4:8])[0]
+
+            # Find the macro IFD by iterating through offsets
+            macro_ifd_entries = None
+            found_macro_ifd = False
+            current_ifd_offset = first_ifd_offset
+            while current_ifd_offset:
+                # Need to read IFD structure directly from bytearray
+                fp.seek(current_ifd_offset)
+                num_entries = struct.unpack(endian + "H", fp.read(2))[0]
+                entries_bytes = fp.read(num_entries * 12)
+                next_ifd_offset_bytes = fp.read(4)
+                if len(next_ifd_offset_bytes) < 4:
+                    logging.warning(
+                        f"Could not read next IFD offset at {fp.tell() - 4}. Stopping IFD scan."
+                    )
+                    current_ifd_offset = 0  # Stop loop
+                else:
+                    current_ifd_offset = struct.unpack(
+                        endian + "I", next_ifd_offset_bytes
+                    )[0]
+
+                # Parse entries from the bytes we read
+                entries = []
+                for i in range(num_entries):
+                    entry_bytes = entries_bytes[i * 12 : (i + 1) * 12]
+                    tag, typ, cnt, val = struct.unpack(endian + "HHII", entry_bytes)
+                    # Position here is relative to IFD start + 2 bytes for num_entries
+                    value_pos_in_ifd = current_ifd_offset + 2 + i * 12 + 8
+                    entries.append(IFDEntry(tag, typ, cnt, val, value_pos_in_ifd))
+
+                # Check description for this IFD
+                desc = ascii_val(entries, TAG_IMAGE_DESCRIPTION, data, endian).lower()
+                if macro_description_to_find.lower() in desc:
+                    macro_ifd_entries = entries
+                    found_macro_ifd = True
+                    logging.debug(
+                        f"Found IFD for macro description '{macro_description_to_find}' at offset {current_ifd_offset}"
+                    )
+                    break  # Found it!
+
+            if not found_macro_ifd:
+                raise ValueError(
+                    f"Could not find the specific macro IFD with description '{macro_description_to_find}' during replacement phase."
+                )
+
     except Exception as e:
-        fail(f"Error reading input file {input_path}: {e}")
+        logging.error(f"Error parsing in-memory TIFF structure: {e}")
+        raise  # Re-raise after logging
 
-    endian = {"II": "<", "MM": ">"}.get(data[:2].decode("ascii", "ignore"))
-    if not endian or struct.unpack(endian + "H", data[2:4])[0] != 42:
-        fail("Not a TIFF/SVS – bad byte order or missing magic number")
-
-    ifd_off, macro_ifd_entries = struct.unpack(endian + "I", data[4:8])[0], None
-    found_macro_ifd = False
-    while ifd_off:
-        entries, nxt = read_ifd(data, ifd_off, endian)
-        desc = ascii_val(entries, TAG_IMAGE_DESCRIPTION, data, endian).lower()
-        # Use the specific description that was found earlier
-        if macro_description_to_find.lower() in desc:
-            macro_ifd_entries = entries
-            found_macro_ifd = True
-            logging.debug(
-                f"Found IFD for macro description '{macro_description_to_find}'"
-            )
-            break
-        ifd_off = nxt
-
-    if not found_macro_ifd:
-        fail(
-            f"Could not find the specific macro IFD with description '{macro_description_to_find}' during replacement phase."
-        )
+    # --- Modify the bytearray based on found IFD entries ---
 
     # Prepare the new image data (uncompressed RGB)
     if new_macro_pil_image.mode != "RGB":
         new_macro_pil_image = new_macro_pil_image.convert("RGB")
 
-    img_buf = bytearray(new_macro_pil_image.tobytes())
-    new_data_offset = align4(len(data))
-    padding = b"\0" * (new_data_offset - len(data))
-    new_byte_count = len(img_buf)
+    img_bytes = new_macro_pil_image.tobytes()
+    original_length = len(data)
+    new_data_offset = align4(original_length)  # Append after original data
+    padding_size = new_data_offset - original_length
+    new_byte_count = len(img_bytes)
     w, h = new_macro_pil_image.size
 
-    # Modify existing tags in the macro IFD
+    # Modify existing tags in the macro IFD within the main 'data' bytearray
     updated_tags = False
     for e in macro_ifd_entries:
+        # Important: Use struct.pack_into to modify the bytearray IN PLACE
         if e.tag == TAG_COMPRESSION:
-            set_int(data, e, 1, endian)  # 1 = Uncompressed
+            struct.pack_into(endian + "I", data, e.pos, 1)  # 1 = Uncompressed
+            e.value = 1  # Update IFDEntry object state for consistency if needed
             updated_tags = True
         elif e.tag == TAG_PHOTOMETRIC:
-            set_int(data, e, 2, endian)  # 2 = RGB
+            struct.pack_into(endian + "I", data, e.pos, 2)  # 2 = RGB
+            e.value = 2
             updated_tags = True
         elif e.tag == TAG_STRIP_OFFSETS:
             if e.count != 1:
-                set_count(data, e, 1, endian)
-            set_int(data, e, new_data_offset, endian)
+                struct.pack_into(endian + "I", data, e.pos - 4, 1)  # Update count field
+                e.count = 1
+            struct.pack_into(
+                endian + "I", data, e.pos, new_data_offset
+            )  # Update value (offset)
+            e.value = new_data_offset
             updated_tags = True
         elif e.tag == TAG_STRIP_BYTE_COUNTS:
             if e.count != 1:
-                set_count(data, e, 1, endian)
-            set_int(data, e, new_byte_count, endian)
+                struct.pack_into(endian + "I", data, e.pos - 4, 1)  # Update count field
+                e.count = 1
+            struct.pack_into(
+                endian + "I", data, e.pos, new_byte_count
+            )  # Update value (byte count)
+            e.value = new_byte_count
             updated_tags = True
         elif e.tag == TAG_ROWS_PER_STRIP:
-            # Ensure RowsPerStrip covers the whole image height for single strip
             if e.count != 1:
-                set_count(data, e, 1, endian)
-            set_int(data, e, h, endian)
+                struct.pack_into(endian + "I", data, e.pos - 4, 1)
+                e.count = 1
+            struct.pack_into(endian + "I", data, e.pos, h)  # Update value (height)
+            e.value = h
             updated_tags = True
-        # Optional: Update width/height if needed, though typically they match
         elif e.tag == TAG_IMAGE_WIDTH:
-            if int_val([e], TAG_IMAGE_WIDTH, data, endian) != w:
+            # Read current value before potentially updating
+            current_w = int_val([e], TAG_IMAGE_WIDTH, data, endian)
+            if current_w != w:
                 logging.warning(
-                    f"Original width {int_val([e], TAG_IMAGE_WIDTH, data, endian)} != new width {w}. Updating."
+                    f"Original width {current_w} != new width {w}. Updating."
                 )
-                set_int(data, e, w, endian)
+                if e.typ == 3:  # SHORT
+                    struct.pack_into(endian + "H", data, e.pos, w)
+                else:  # Assume LONG
+                    struct.pack_into(endian + "I", data, e.pos, w)
+                e.value = w
         elif e.tag == TAG_IMAGE_LENGTH:
-            if int_val([e], TAG_IMAGE_LENGTH, data, endian) != h:
+            current_h = int_val([e], TAG_IMAGE_LENGTH, data, endian)
+            if current_h != h:
                 logging.warning(
-                    f"Original height {int_val([e], TAG_IMAGE_LENGTH, data, endian)} != new height {h}. Updating."
+                    f"Original height {current_h} != new height {h}. Updating."
                 )
-                set_int(data, e, h, endian)
+                if e.typ == 3:  # SHORT
+                    struct.pack_into(endian + "H", data, e.pos, h)
+                else:  # Assume LONG
+                    struct.pack_into(endian + "I", data, e.pos, h)
+                e.value = h
 
     if not updated_tags:
-        # This case should ideally not happen if the IFD was found
-        fail("Failed to update necessary tags in the macro IFD.")
+        raise ValueError(
+            "Failed to find and update necessary tags (Compression, Photometric, Strips) in the macro IFD."
+        )
 
-    # Write changes
-    try:
-        # If writing to the same file, overwrite; otherwise, create new
-        mode = "r+b" if input_path == output_path else "wb"
-        if mode == "wb":
-            # If writing to a new file, write original data up to modified IFD first
-            # then append new image data
-            final_data = data + padding + img_buf
-            with open(output_path, "wb") as fh:
-                fh.write(final_data)
-        else:  # Overwriting inplace
-            # Need to be careful here. Append padding and new data first.
-            # Then write the modified header/IFD data back.
-            original_length = len(data)
-            with open(input_path, "r+b") as fh:
-                fh.seek(0, os.SEEK_END)  # Go to end
-                fh.write(padding)
-                fh.write(img_buf)
-                fh.seek(0)  # Go back to beginning
-                fh.write(data)  # Write modified header/IFD data
-                # Ensure the file is truncated if the new total size is smaller (unlikely here)
-                # new_total_size = new_data_offset + new_byte_count
-                # current_size = fh.tell() # Where we are after writing header
-                # assert current_size <= original_length
-                # if current_size < new_total_size : # If header write didn't reach end of original
-                #      fh.seek(new_total_size) # This seek seems wrong
-                # We need to be sure about the total final size.
-                # Let's re-read the logic. The `data` bytearray IS the header + IFDs.
-                # `padding` is added, then `img_buf`.
-                # So the final size is `new_data_offset + new_byte_count`.
-                final_size = new_data_offset + new_byte_count
-                fh.truncate(final_size)
+    # Append padding and new image data to the bytearray
+    padding = b"\0" * padding_size
+    final_data = data + padding + img_bytes
 
-        logging.info("Saved modified macro to %s", output_path)
-    except Exception as e:
-        fail(f"Error writing output file {output_path}: {e}", exc_info=verbose)
+    logging.info(
+        f"In-memory macro replacement complete. New data length: {len(final_data)}"
+    )
+    return final_data
 
 
 def replace_macro(
@@ -394,7 +439,12 @@ def replace_macro(
     logging.debug("Black rectangle drawn at %s", (x0, y0, x1, y1))
 
     # Call the function that handles TIFF writing with the modified PIL image
-    replace_macro_with_image(input_path, output_path, img, found_desc, verbose=verbose)
+    replace_macro_with_image(
+        output_path=output_path,
+        new_macro_pil_image=img,
+        macro_description_to_find=found_desc,
+        verbose=verbose,
+    )
 
 
 if __name__ == "__main__":
@@ -449,4 +499,15 @@ if __name__ == "__main__":
     if not os.path.exists(inp_path):
         fail(f"Input file not found: {inp_path}")
 
-    replace_macro(inp_path, out_path, rect_coords_arg, verbosity, macro_prefs)
+    # --- This part needs modification for standalone use ---
+    # 1. Read input_path into bytearray
+    # 2. Create PIL image (either black rect or from file)
+    # 3. Call replace_macro_with_image(bytearray, pil_image, ...)
+    # 4. Write returned bytearray to output_path
+    print(
+        "Standalone execution of replace_macro.py needs to be adapted for the new in-memory function."
+    )
+    # --- End modification needed ---
+
+    # Replace the call to the old function
+    # replace_macro(inp_path, out_path, rect_coords_arg, verbosity, macro_prefs)

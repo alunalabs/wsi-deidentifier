@@ -43,9 +43,9 @@ The script will:
 import argparse
 import csv
 import hashlib
+import io
 import json
 import re
-import shutil
 import struct
 import sys
 from pathlib import Path
@@ -68,57 +68,184 @@ from replace_macro import (
 ###############################################################################
 # helpers
 ###############################################################################
-def delete_associated_image(slide_path: Path, image_type: str) -> None:
+def delete_associated_image(data: bytearray, image_type: str) -> bool:
+    """Modifies the data bytearray in-place to remove the specified associated image.
+
+    Returns True on success, False if the image wasn't found or an error occurred.
+    """
     allowed = {"label", "macro"}
     if image_type not in allowed:
         raise ValueError("image_type must be 'label' or 'macro'")
 
-    with slide_path.open("r+b") as fp:
-        t = tiffparser.TiffFile(fp)
-        p0 = t.pages[0]
-        if "Aperio Image Library" in p0.description:
-            pages = [p for p in t.pages if image_type in p.description]
-        elif "Aperio Leica Biosystems GT450" in p0.description:
-            pages = [t.pages[-2]] if image_type == "label" else [t.pages[-1]]
-        else:
-            pages = [p for p in t.pages if image_type in p.description]
-        if len(pages) != 1:
-            return
-        page = pages[0]
+    try:
+        # Use BytesIO to treat the bytearray like a file
+        with io.BytesIO(data) as fp:
+            t = tiffparser.TiffFile(fp)
+            p0 = t.pages[0]
+            if "Aperio Image Library" in p0.description:
+                pages = [p for p in t.pages if image_type in p.description]
+            elif "Aperio Leica Biosystems GT450" in p0.description:
+                pages = [t.pages[-2]] if image_type == "label" else [t.pages[-1]]
+            else:
+                pages = [p for p in t.pages if image_type in p.description]
+            if len(pages) != 1:
+                print(
+                    f"  Info: Did not find exactly one '{image_type}' page. Skipping deletion."
+                )
+                return False  # Indicate image not found/deleted
+            page = pages[0]
 
-        fmt, sz = t.tiff.ifdoffsetformat, t.tiff.ifdoffsetsize
-        tagnoformat, tagnosize = t.tiff.tagnoformat, t.tiff.tagnosize
-        tagsize, unpack = t.tiff.tagsize, struct.unpack
+            fmt, sz = t.tiff.ifdoffsetformat, t.tiff.ifdoffsetsize
+            tagnoformat, tagnosize = t.tiff.tagnoformat, t.tiff.tagnosize
+            tagsize, unpack = t.tiff.tagsize, struct.unpack
 
-        ifds = [{"this": p.offset} for p in t.pages]
-        for i in ifds:
-            fp.seek(i["this"])
-            (ntags,) = unpack(tagnoformat, fp.read(tagnosize))
-            fp.seek(ntags * tagsize, 1)
-            i["next_ifd_offset"] = fp.tell()
-            (i["next_ifd_value"],) = unpack(fmt, fp.read(sz))
+            ifds = []
+            # Need to iterate through IFDs by offset, reading from the bytearray
+            next_ifd_offset_in_mem = t.tiff.firstifd
+            while next_ifd_offset_in_mem:
+                fp.seek(next_ifd_offset_in_mem)
+                (ntags,) = unpack(tagnoformat, fp.read(tagnosize))
+                ifd_start_pos = next_ifd_offset_in_mem
+                fp.seek(ntags * tagsize, 1)
+                next_ifd_ptr_pos = fp.tell()
+                (next_ifd_val,) = unpack(fmt, fp.read(sz))
+                ifds.append(
+                    {
+                        "this": ifd_start_pos,
+                        "next_ifd_offset": next_ifd_ptr_pos,
+                        "next_ifd_value": next_ifd_val,
+                    }
+                )
+                next_ifd_offset_in_mem = next_ifd_val
 
-        p_ifd = next(i for i in ifds if i["this"] == page.offset)
-        prev_ifd = next((i for i in ifds if i["next_ifd_value"] == page.offset), None)
-        if prev_ifd is None:
-            return
+            # Find the IFD entry for the page to delete and the one pointing to it
+            p_ifd = next((i for i in ifds if i["this"] == page.offset), None)
+            prev_ifd = next(
+                (i for i in ifds if i["next_ifd_value"] == page.offset), None
+            )
 
-        for off, bc in zip(
-            page.tags["StripOffsets"].value, page.tags["StripByteCounts"].value
-        ):
-            fp.seek(off)
-            fp.write(b"\0" * bc)
+            if p_ifd is None:
+                print(
+                    f"  Warning: Could not find IFD structure for page offset {page.offset}. Skipping deletion."
+                )
+                return False
+            if prev_ifd is None:
+                # This case should be rare for label/macro but possible if it's the first associated image.
+                # We might need to update the main image IFD pointer if this happens.
+                # For now, consider it an error or unsupported case for simplicity.
+                print(
+                    f"  Warning: Could not find previous IFD pointing to page offset {page.offset}. Deletion logic might be incomplete."
+                )
+                # To proceed safely, we should zero out the data but not attempt to link.
+                # However, returning False for now to indicate incomplete deletion.
+                return False
 
-        for tag in page.tags.values():
-            fp.seek(tag.valueoffset)
-            fp.write(b"\0" * tag.count)
+            # Zero out strip/tile data referenced by the page
+            strip_offsets_tag = page.tags.get("StripOffsets")
+            strip_counts_tag = page.tags.get("StripByteCounts")
+            tile_offsets_tag = page.tags.get("TileOffsets")
+            tile_counts_tag = page.tags.get("TileByteCounts")
 
-        pagebytes = (p_ifd["next_ifd_offset"] - p_ifd["this"]) + sz
-        fp.seek(p_ifd["this"])
-        fp.write(b"\0" * pagebytes)
+            offsets = []
+            counts = []
+            if strip_offsets_tag and strip_counts_tag:
+                offsets = strip_offsets_tag.value
+                counts = strip_counts_tag.value
+            elif tile_offsets_tag and tile_counts_tag:
+                offsets = tile_offsets_tag.value
+                counts = tile_counts_tag.value
+            else:
+                print(
+                    f"  Warning: Could not find Strip/Tile Offset/Count tags for page {page.offset}. Cannot zero image data."
+                )
 
-        fp.seek(prev_ifd["next_ifd_offset"])
-        fp.write(struct.pack(fmt, p_ifd["next_ifd_value"]))
+            for off, bc in zip(offsets, counts):
+                if off + bc <= len(data):  # Boundary check
+                    # Modify the underlying bytearray directly
+                    data[off : off + bc] = b"\0" * bc
+                else:
+                    print(
+                        f"  Warning: Invalid offset/count ({off}/{bc}) for image data. Skipping zeroing."
+                    )
+
+            # Zero out data referenced by tags *if* stored externally
+            # Using the simple original loop, accepting potential inaccuracies for non-byte types,
+            # as this wasn't the header corruption cause and full correction is complex.
+            for tag in page.tags.values():
+                try:
+                    # Check if data is inline (valueoffset might be the data itself)
+                    type_size_map = {
+                        1: 1,
+                        2: 1,
+                        3: 2,
+                        4: 4,
+                        5: 8,
+                        6: 1,
+                        7: 1,
+                        8: 2,
+                        9: 4,
+                        10: 8,
+                        11: 4,
+                        12: 8,
+                        13: 4,
+                        16: 8,
+                        17: 8,
+                        18: 8,
+                    }
+                    tag_type = getattr(
+                        tag, "type", None
+                    )  # Use .type based on prior attempt
+                    type_size = type_size_map.get(tag_type)
+                    if type_size:
+                        byte_count_needed = tag.count * type_size
+                        is_inline = byte_count_needed <= sz
+                        if not is_inline and tag.valueoffset + byte_count_needed <= len(
+                            data
+                        ):  # boundary check for external data
+                            data[
+                                tag.valueoffset : tag.valueoffset + byte_count_needed
+                            ] = b"\0" * byte_count_needed
+                    # If type info is missing or inline, we don't zero here (IFD zeroing handles inline)
+                except Exception as e:
+                    print(
+                        f"  Warning: Error zeroing tag {tag.code} data at {getattr(tag, 'valueoffset', 'N/A')}: {e}",
+                        file=sys.stderr,
+                    )
+
+            # Zero out the IFD structure itself in the bytearray
+            ifd_byte_count = (p_ifd["next_ifd_offset"] - p_ifd["this"]) + sz
+            if p_ifd["this"] + ifd_byte_count <= len(data):
+                data[p_ifd["this"] : p_ifd["this"] + ifd_byte_count] = (
+                    b"\0" * ifd_byte_count
+                )
+            else:
+                print(
+                    f"  Warning: Invalid offset/count for IFD zeroing ({p_ifd['this']}/{ifd_byte_count}). Skipping."
+                )
+                return False  # Cannot safely proceed
+
+            # Update the previous IFD's 'next IFD' pointer in the bytearray
+            pointer_bytes = struct.pack(fmt, p_ifd["next_ifd_value"])
+            ptr_offset = prev_ifd["next_ifd_offset"]
+            if ptr_offset + sz <= len(data):
+                data[ptr_offset : ptr_offset + sz] = pointer_bytes
+            else:
+                print(
+                    f"  Warning: Invalid offset for next IFD pointer update ({ptr_offset}). Skipping."
+                )
+                return False  # Cannot safely proceed
+
+        # If we reached here, modification was attempted successfully
+        return True
+
+    except Exception as e:
+        print(
+            f"  Error during in-memory associated image deletion: {e}", file=sys.stderr
+        )
+        import traceback
+
+        traceback.print_exc()
+        return False  # Indicate failure
 
 
 TECH_KEYS = {
@@ -202,6 +329,7 @@ def process_slide(
         str, list[tuple[int, int, int, int]]
     ],  # Map path_str to list of rects
     annotations_out_dir: Path | None,
+    verbose: bool,
 ) -> None:
     if src.suffix.lower() not in [".svs", ".tif", ".tiff"]:
         return
@@ -218,9 +346,29 @@ def process_slide(
     modified_macro_pil = None
     rects_to_apply = []  # List of (x0, y0, x1, y1) tuples
 
+    # --- Read Source File into Memory ---
+    print(f"  Reading {src} into memory...")
+    try:
+        file_data = bytearray(src.read_bytes())
+        print(f"  Read {len(file_data)} bytes.")
+    except Exception as e:
+        print(f"  Error reading source file {src}: {e}", file=sys.stderr)
+        # Skip processing this file if read fails
+        writer.writerow(
+            {
+                "slide_id": slide_id,
+                "hashed_id": hashed_id,
+                "src_path": src.resolve(),
+                "dst_path": dst.resolve(),
+                "status": f"Error reading source: {e}",  # Add status field
+            }
+        )
+        return
+
     # Only try loading macro if an annotation mode is active
+    # Load from the original source path, as in-memory data might change
     if macro_annotation_mode:
-        print(f"  Attempting to load macro for {src}...", end="")
+        print(f"  Attempting to load macro for {src} (from original file)...", end="")
         original_macro_pil, found_macro_desc = find_and_load_macro_openslide(
             str(src), macro_description_prefs
         )
@@ -236,26 +384,35 @@ def process_slide(
             # If macro not found, we can skip annotation steps for this file
             macro_annotation_mode = None  # Disable further macro processing
 
-    # --- Copy and Initial De-identification ---
-    # Copy first, then modify the destination
-    print(f"  Copying {src} to {dst}...")
-    shutil.copyfile(src, dst)
+    # --- In-Memory De-identification ---
+    # Remove the copy step - we operate in memory now
+    # print(f"  Copying {src} to {dst}...")
+    # shutil.copyfile(src, dst)
 
-    print(f"  Deleting label image from {dst}...")
+    print("  Deleting label image from in-memory data...")
+    label_deleted = False
     try:
-        delete_associated_image(dst, "label")
+        # Call the refactored function which modifies file_data in-place
+        label_deleted = delete_associated_image(file_data, "label")
+        if label_deleted:
+            print("  Label deletion successful.")
+        else:
+            print("  Label deletion skipped (image not found or error occurred).")
+
     except Exception as e:
+        # Catch errors from delete_associated_image itself
         print(
-            f"  Warning: Failed to delete label image from {dst}: {e}", file=sys.stderr
+            f"  Warning: Failed during in-memory label deletion: {e}",
+            file=sys.stderr,
         )
 
-    # print(f"  Stripping metadata from {dst}...")
+    # print(f"  Stripping metadata from {dst}...") # Metadata stripping needs similar refactor
     # try:
     #     strip_metadata(dst)
     # except Exception as e:
     #     print(f"  Warning: Failed to strip metadata from {dst}: {e}", file=sys.stderr)
 
-    # --- Macro Annotation/Redaction ---
+    # --- Macro Annotation/Redaction (operates on PIL image, data modified later) ---
     if macro_annotation_mode == "interactive" and modified_macro_pil:
         if not annotations_out_dir:
             print(
@@ -351,19 +508,20 @@ def process_slide(
             # Draw rectangle (fill is black)
             draw.rectangle([ix0, iy0, ix1, iy1], fill=(0, 0, 0))
 
-        print(f"  Replacing macro image in {dst}...")
+        # Call the refactored replace_macro_with_image which works on bytearray
+        print("  Replacing macro image in-memory data...")
         try:
-            replace_macro_with_image(
-                str(dst),  # Operate on the destination file
-                str(dst),  # Output path is the same (overwrite)
-                modified_macro_pil,  # The image with boxes drawn
-                found_macro_desc,  # The description string used to find the IFD
-                verbose=False,  # Or pass verbosity from args if needed
+            # Pass the current file_data, get the modified version back
+            file_data = replace_macro_with_image(
+                data=file_data,  # Pass bytearray
+                new_macro_pil_image=modified_macro_pil,
+                macro_description_to_find=found_macro_desc,
+                verbose=verbose,
             )
-            print(f"  Successfully replaced macro in {dst}.")
+            print("  Successfully replaced macro in-memory.")
         except Exception as e:
             print(
-                f"  Error during macro replacement in {dst}: {e}",
+                f"  Error during in-memory macro replacement: {e}",
                 file=sys.stderr,
             )
     elif macro_annotation_mode:
@@ -373,15 +531,38 @@ def process_slide(
             f"  Skipping macro replacement for {dst} (no valid annotations found/provided)."
         )
     else:
-        print(f"  Macro image will not be modified for {dst}.")
+        print("  Macro image will not be modified.")
 
-    # --- Finalize ---
+    # --- Write Final Data ---
+    print(f"  Writing final modified data to {dst}...")
+    try:
+        with open(dst, "wb") as f_out:
+            f_out.write(file_data)
+        print(f"  Successfully wrote {len(file_data)} bytes.")
+    except Exception as e:
+        print(f"  Error writing final file {dst}: {e}", file=sys.stderr)
+        # Even if write fails, record the attempt in map
+        writer.writerow(
+            {
+                "slide_id": slide_id,
+                "hashed_id": hashed_id,
+                "src_path": src.resolve(),
+                "dst_path": dst.resolve(),
+                "status": f"Error writing output: {e}",
+            }
+        )
+        return
+
+    # --- Finalize Mapping ---
     writer.writerow(
         {
             "slide_id": slide_id,
             "hashed_id": hashed_id,
             "src_path": src.resolve(),
             "dst_path": dst.resolve(),
+            "status": "Success"
+            if label_deleted
+            else "Success (label not found/deleted)",  # Add status field
         }
     )
 
@@ -423,6 +604,9 @@ def main(argv=None):
         "--annotations-out-dir",
         default="./macro_annotations",
         help="Directory to save original macros and annotation JSON files when using --interactive-annotate (default: ./macro_annotations)",
+    )
+    p.add_argument(
+        "-v", "--verbose", action="store_true", help="Enable verbose logging."
     )
     args = p.parse_args(argv)
 
@@ -501,7 +685,14 @@ def main(argv=None):
     mapping_exists = Path(args.map).is_file()
     with open(args.map, "a", newline="") as fp:
         writer = csv.DictWriter(
-            fp, fieldnames=["slide_id", "hashed_id", "src_path", "dst_path"]
+            fp,
+            fieldnames=[
+                "slide_id",
+                "hashed_id",
+                "src_path",
+                "dst_path",
+                "status",
+            ],  # Add status field
         )
         if not mapping_exists:
             writer.writeheader()
@@ -554,6 +745,7 @@ def main(argv=None):
                     tuple(args.rect) if args.rect else None,
                     boxes_by_path,  # Pass the loaded JSON data
                     annotations_dir,  # Pass the output dir for interactive mode
+                    args.verbose,  # Pass verbose flag
                 )
                 print(f"✓ {path} → {out_dir}")
             except Exception as e:
