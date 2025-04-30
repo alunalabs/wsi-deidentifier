@@ -729,11 +729,6 @@ def main(argv=None):
 
         for path in sorted(list(all_paths)):
             print(f"Processing path: {path}")
-            path_str = str(path.resolve())
-
-            # Determine rectangle source for this specific file
-            # This logic is now handled inside process_slide based on macro_mode
-
             try:
                 process_slide(
                     path,
