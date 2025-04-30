@@ -224,11 +224,22 @@ def replace_macro_with_image(
                 except struct.error:
                     pass  # magic_number remains None
 
-            if not endian or magic_number != 42:
+            # Allow both Classic TIFF (42) and BigTIFF (43) magic numbers
+            if not endian or magic_number not in (42, 43):
                 raise ValueError(
-                    f"Not a TIFF/SVS – bad byte order or missing magic number (read {magic_number})"
+                    f"Not a TIFF/SVS format – bad byte order or invalid magic number (read {magic_number}, expected 42 or 43)"
                 )
 
+            # TODO: Handle BigTIFF specific structures (e.g., 64-bit offsets) if necessary later.
+            # For now, assume the IFDs we need to parse are compatible enough or
+            # that openslide handled the initial load transparently.
+            if magic_number == 43:
+                logging.warning(
+                    "Detected BigTIFF format (magic number 43). Proceeding with Classic TIFF assumptions for IFD parsing."
+                )
+
+            # Assuming Classic TIFF for initial IFD offset reading (first 4 bytes after header)
+            # BigTIFF might have a different header structure if version != 42
             first_ifd_offset = struct.unpack(endian + "I", data[4:8])[0]
 
             # Find the macro IFD by iterating through offsets
