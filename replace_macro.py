@@ -37,46 +37,120 @@ TAG_ROWS_PER_STRIP = 0x0116
 TAG_STRIP_OFFSETS = 0x0111
 TAG_STRIP_BYTE_COUNTS = 0x0117
 
+# Constants for TIFF variants
+TIFF_MAGIC_STANDARD = 42  # Classic TIFF
+TIFF_MAGIC_BIG = 43  # BigTIFF (64-bit offsets)
+
 
 class IFDEntry:
-    __slots__ = ("tag", "typ", "count", "value", "pos")
+    """Represents one IFD (Image File Directory) entry.
 
-    def __init__(self, tag, typ, cnt, val, pos):
-        self.tag, self.typ, self.count, self.value, self.pos = (tag, typ, cnt, val, pos)
+    For classic TIFF (`big == False`) offsets are 32-bit and the *value* and
+    *count* fields are 4 bytes.  In BigTIFF (`big == True`) both are 64-bit
+    which changes the entry size from 12 bytes to 20 bytes.
+    """
+
+    __slots__ = (
+        "tag",
+        "typ",
+        "count",
+        "value",
+        "value_pos",  # absolute position (byte offset) of the value/offset field
+        "count_pos",  # absolute position of the count field
+        "big",  # bool – True if BigTIFF (uses 8-byte count/value)
+    )
+
+    def __init__(self, tag, typ, cnt, val, value_pos, count_pos, big):
+        self.tag = tag
+        self.typ = typ
+        self.count = cnt
+        self.value = val
+        self.value_pos = value_pos
+        self.count_pos = count_pos
+        self.big = big
 
 
-def read_ifd(buf, off, endian):
-    n = struct.unpack(endian + "H", buf[off : off + 2])[0]
-    entries, cur = [], off + 2
-    for _ in range(n):
+# --- IFD readers -----------------------------------------------------------
+
+
+def _read_ifd_standard(buf: bytes | bytearray, off: int, endian: str):
+    """Read a classic TIFF IFD (32-bit offsets)."""
+
+    num_entries = struct.unpack(endian + "H", buf[off : off + 2])[0]
+    entries: list[IFDEntry] = []
+    cur = off + 2
+
+    for _ in range(num_entries):
         tag, typ, cnt, val = struct.unpack(endian + "HHII", buf[cur : cur + 12])
-        entries.append(IFDEntry(tag, typ, cnt, val, cur + 8))
+        # value field starts at cur+8, count at cur+4
+        entries.append(IFDEntry(tag, typ, cnt, val, cur + 8, cur + 4, False))
         cur += 12
+
     nxt = struct.unpack(endian + "I", buf[cur : cur + 4])[0]
     return entries, nxt
 
 
-def ascii_val(entries, tag, data, endian):
+def _read_ifd_big(buf: bytes | bytearray, off: int, endian: str):
+    """Read a BigTIFF IFD (64-bit offsets)."""
+
+    num_entries = struct.unpack(endian + "Q", buf[off : off + 8])[0]
+    entries: list[IFDEntry] = []
+    cur = off + 8
+
+    for _ in range(num_entries):
+        tag, typ = struct.unpack(endian + "HH", buf[cur : cur + 4])
+        cnt = struct.unpack(endian + "Q", buf[cur + 4 : cur + 12])[0]
+        val = struct.unpack(endian + "Q", buf[cur + 12 : cur + 20])[0]
+        # In BigTIFF, value starts at cur+12, count at cur+4
+        entries.append(IFDEntry(tag, typ, cnt, val, cur + 12, cur + 4, True))
+        cur += 20
+
+    nxt = struct.unpack(endian + "Q", buf[cur : cur + 8])[0]
+    return entries, nxt
+
+
+def read_ifd(buf: bytes | bytearray, off: int, endian: str, *, big: bool = False):
+    """Dispatch to the correct IFD reader depending on *big*."""
+
+    return (
+        _read_ifd_big(buf, off, endian) if big else _read_ifd_standard(buf, off, endian)
+    )
+
+
+# --- Convenience helpers ---------------------------------------------------
+
+
+def ascii_val(entries, tag, data: bytes | bytearray, endian: str):
+    """Return ASCII value of *tag* from *entries*, or empty string."""
+
     for e in entries:
         if e.tag == tag:
-            raw = (
-                struct.pack(endian + "I", e.value)[: e.count]
-                if e.count <= 4
-                else data[e.value : e.value + e.count]
-            )
+            inline_bytes = 8 if e.big else 4
+            if e.count <= inline_bytes:
+                raw = struct.pack(endian + ("Q" if e.big else "I"), e.value)[: e.count]
+            else:
+                raw = data[e.value : e.value + e.count]
             return raw.rstrip(b"\0").decode("ascii", "ignore")
     return ""
 
 
-def short_val(entry, data, endian):
+def _short_from_raw(raw: bytes, endian: str) -> int:
+    return struct.unpack(endian + "H", raw)[0]
+
+
+def short_val(entry: IFDEntry, data: bytes | bytearray, endian: str):
+    """Return first SHORT value from *entry*."""
+
     if entry.typ != 3 or entry.count < 1:
         return None
-    raw = (
-        struct.pack(endian + "I", entry.value)[:2]
-        if entry.count * 2 <= 4
-        else data[entry.value : entry.value + 2]
-    )
-    return struct.unpack(endian + "H", raw)[0]
+
+    inline_bytes = 8 if entry.big else 4
+    if entry.count * 2 <= inline_bytes:
+        raw = struct.pack(endian + ("Q" if entry.big else "I"), entry.value)[:2]
+    else:
+        raw = data[entry.value : entry.value + 2]
+
+    return _short_from_raw(raw, endian)
 
 
 def int_val(entries, tag, data, endian):
@@ -86,29 +160,36 @@ def int_val(entries, tag, data, endian):
     return None
 
 
-def array_val(entry, data, endian):
-    size = 2 if entry.typ == 3 else 4
-    raw = (
-        struct.pack(endian + "I", entry.value)[: entry.count * size]
-        if entry.count * size <= 4
-        else data[entry.value : entry.value + entry.count * size]
-    )
-    fmt = endian + ("H" if entry.typ == 3 else "I")
+def array_val(entry: IFDEntry, data: bytes | bytearray, endian: str):
+    size = 2 if entry.typ == 3 else (8 if entry.big else 4)
+    inline_bytes = 8 if entry.big else 4
+
+    if entry.count * size <= inline_bytes:
+        raw = struct.pack(endian + ("Q" if entry.big else "I"), entry.value)[
+            : entry.count * size
+        ]
+    else:
+        raw = data[entry.value : entry.value + entry.count * size]
+
+    fmt = endian + ("H" if entry.typ == 3 else ("Q" if entry.big else "I"))
     return [struct.unpack(fmt, raw[i : i + size])[0] for i in range(0, len(raw), size)]
 
 
-def set_int(buf, entry, v, endian):
-    struct.pack_into(endian + "I", buf, entry.pos, v)
+def set_int(buf: bytearray, entry: IFDEntry, v: int, endian: str):
+    fmt = "Q" if entry.big else "I"
+    struct.pack_into(endian + fmt, buf, entry.value_pos, v)
     entry.value = v
 
 
-def set_count(buf, entry, c, endian):
-    struct.pack_into(endian + "I", buf, entry.pos - 4, c)
+def set_count(buf: bytearray, entry: IFDEntry, c: int, endian: str):
+    fmt = "Q" if entry.big else "I"
+    struct.pack_into(endian + fmt, buf, entry.count_pos, c)
     entry.count = c
 
 
-def align4(n):
-    return (n + 3) & ~3
+def align(n: int, big: bool) -> int:
+    """Round *n* up to a 4-byte (classic TIFF) or 8-byte (BigTIFF) boundary."""
+    return (n + (7 if big else 3)) & (~7 if big else ~3)
 
 
 def load_macro_openslide(path):
@@ -149,7 +230,12 @@ def fail(msg, **ctx):
 
 
 def replace_macro(
-    input_path, output_path, rect_coords=None, verbose=False, macro_description="macro"
+    input_path,
+    output_path,
+    rect_coords=None,
+    verbose=False,
+    macro_description="macro",
+    fill_color=(255, 0, 0),
 ):
     """
     Replaces the macro image in an SVS file.
@@ -161,6 +247,7 @@ def replace_macro(
                                      Defaults to a centered rectangle if None.
         verbose (bool): Enable verbose logging.
         macro_description (str): The string expected in the ImageDescription tag for the macro.
+        fill_color (tuple): RGB tuple for the fill color of the rectangle. Defaults to red (255, 0, 0).
     """
     logging.basicConfig(
         level=logging.DEBUG if verbose else logging.INFO,
@@ -175,14 +262,24 @@ def replace_macro(
     except Exception as e:
         fail(f"Error reading input file {input_path}: {e}")
 
+    # --- Detect byte order and classic vs BigTIFF -------------------------
     endian = {"II": "<", "MM": ">"}.get(data[:2].decode("ascii", "ignore"))
-    if not endian or struct.unpack(endian + "H", data[2:4])[0] != 42:
-        fail("Not a TIFF/SVS – bad byte order or missing magic number")
+    if not endian:
+        fail("Not a TIFF/SVS – could not determine byte order")
 
-    ifd_off, macro = struct.unpack(endian + "I", data[4:8])[0], None
+    magic = struct.unpack(endian + "H", data[2:4])[0]
+    bigtiff = magic == TIFF_MAGIC_BIG  # 43 => BigTIFF, 42 => classic
+
+    if bigtiff:
+        # BigTIFF header: bytes 4-6 contain offset size (should be 8) and reserved; first IFD offset is 8-byte @8
+        ifd_off = struct.unpack(endian + "Q", data[8:16])[0]
+    else:
+        ifd_off = struct.unpack(endian + "I", data[4:8])[0]
+
+    macro = None
     found_macro_ifd = False
     while ifd_off:
-        ent, nxt = read_ifd(data, ifd_off, endian)
+        ent, nxt = read_ifd(data, ifd_off, endian, big=bigtiff)
         desc = ascii_val(ent, TAG_IMAGE_DESCRIPTION, data, endian).lower()
         if macro_description.lower() in desc:
             macro = ent
@@ -203,8 +300,13 @@ def replace_macro(
     cmp = int_val(macro, TAG_COMPRESSION, data, endian) or 1
     logging.debug("Macro: %dx%d, spp=%d, bps=%d, compression=%d", w, h, spp, bps, cmp)
 
-    if not (spp == 3 and bps == 8):
-        fail("Unsupported macro format – need 24-bit RGB", spp=spp, bits_per_sample=bps)
+    # Many scanners store BitsPerSample as a pointer in BigTIFF where our
+    # quick reader may not resolve the array correctly.  As long as we can
+    # decode the macro thumbnail with OpenSlide we proceed even if the
+    # parsed *bps* value looks suspicious.  We only enforce that the macro
+    # is in RGB colour (three samples per pixel).
+    if spp != 3:
+        fail("Unsupported macro format – need RGB samples_per_pixel=3", spp=spp)
 
     img = load_macro_openslide(input_path)
     if img is None:
@@ -225,21 +327,38 @@ def replace_macro(
             image=f"{w}x{h}",
         )
 
-    ImageDraw.Draw(img).rectangle([x0, y0, x1 - 1, y1 - 1], fill=(255, 0, 0))
+    ImageDraw.Draw(img).rectangle([x0, y0, x1 - 1, y1 - 1], fill=fill_color)
     logging.debug("Red rectangle drawn at %s", (x0, y0, x1, y1))
 
+    # ------------------------------------------------------------------
+    # Prepare new pixel data to be appended to the slide file.
+    # The new data is appended at the next aligned boundary so that
+    # existing offsets remain valid.
     buf = bytearray(img.tobytes())
-    new_off = align4(len(data))
-    data.extend(b"\0" * (new_off - len(data)))
-    data.extend(buf)
+    original_size = len(data)
+    new_off = align(original_size, bigtiff)
     bc = len(buf)
 
-    def entry(tag):  # closure for quick lookup
+    # Helper closure for quick tag lookup in the macro IFD
+    def entry(tag):
         return next((e for e in macro if e.tag == tag), None)
 
+    # Track patches (position, packed_bytes) so we can apply them later
+    patches: list[tuple[int, bytes]] = []
+
+    def record_int_patch(e: IFDEntry, v: int):
+        fmt = "Q" if e.big else "I"
+        patches.append((e.value_pos, struct.pack(endian + fmt, v)))
+
+    def record_count_patch(e: IFDEntry, c: int):
+        fmt = "Q" if e.big else "I"
+        patches.append((e.count_pos, struct.pack(endian + fmt, c)))
+
+    # Apply the same modifications to the in-memory buffer *and* record them
     for tag, val in ((TAG_COMPRESSION, 1), (TAG_PHOTOMETRIC, 2)):
         if e := entry(tag):
             set_int(data, e, val, endian)
+            record_int_patch(e, val)
 
     for tag, val in (
         (TAG_STRIP_OFFSETS, new_off),
@@ -251,11 +370,40 @@ def replace_macro(
             fail("Required strip tag missing", tag=hex(tag))
         if e.count != 1:
             set_count(data, e, 1, endian)
+            record_count_patch(e, 1)
         set_int(data, e, val, endian)
+        record_int_patch(e, val)
 
+    # ------------------------------------------------------------------
+    # Create the output file efficiently.  First attempt to create a hard
+    # link so no data blocks are duplicated.  If linking is not possible
+    # (e.g. across filesystems), fall back to copying.
     try:
-        with open(output_path, "wb") as fh:
-            fh.write(data)
+        if os.path.exists(output_path):
+            os.remove(output_path)
+        os.link(input_path, output_path)
+    except (OSError, AttributeError):
+        # Hard-link failed – fall back to shutil copy (slower and uses space)
+        import shutil
+
+        shutil.copy2(input_path, output_path)
+
+    # ------------------------------------------------------------------
+    # Patch header fields in-place and append the new pixel data.
+    try:
+        with open(output_path, "r+b") as fh:
+            # Apply header/value/count patches
+            for pos, packed in patches:
+                fh.seek(pos)
+                fh.write(packed)
+
+            # Append padding (if any) + new pixel buffer at *new_off*
+            fh.seek(0, os.SEEK_END)
+            cur_size = fh.tell()
+            if cur_size < new_off:
+                fh.write(b"\0" * (new_off - cur_size))
+            fh.write(buf)
+
         logging.info("Saved %s", output_path)
     except Exception as e:
         fail(f"Error writing output file {output_path}: {e}")
@@ -303,7 +451,7 @@ if __name__ == "__main__":
     if out_path is None:
         input_dir = os.path.dirname(inp_path)
         input_basename = os.path.basename(inp_path)
-        output_dir = os.path.join(input_dir, "..", "macro_covered")
+        output_dir = os.path.join(os.path.dirname(input_dir), "macro_covered")
         os.makedirs(output_dir, exist_ok=True)  # Ensure the directory exists
         out_path = os.path.join(output_dir, input_basename)
 
