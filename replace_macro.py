@@ -229,122 +229,141 @@ def fail(msg, **ctx):
     sys.exit(msg)
 
 
-def replace_macro(
-    input_path,
-    output_path,
-    rect_coords=None,
-    verbose=False,
-    macro_description="macro",
-    fill_color=(255, 0, 0),
-):
-    """
-    Replaces the macro image in an SVS file.
+# ---------------------------------------------------------------------------
+# Public helpers ------------------------------------------------------------
 
-    Args:
-        input_path (str): Path to the input SVS file.
-        output_path (str): Path to save the modified SVS file.
-        rect_coords (tuple, optional): Coordinates (x0, y0, x1, y1) for the redaction rectangle.
-                                     Defaults to a centered rectangle if None.
-        verbose (bool): Enable verbose logging.
-        macro_description (str): The string expected in the ImageDescription tag for the macro.
-        fill_color (tuple): RGB tuple for the fill color of the rectangle. Defaults to red (255, 0, 0).
+
+def read_svs_macro_info(input_path, *, macro_description="macro", verbose=False):
+    """Parse *input_path* and locate the macro IFD.
+
+    Returns a dictionary with the following keys::
+
+        data            – the full file contents (bytearray – mutable)
+        endian          – byte-order mark ("<" little, ">" big)
+        bigtiff         – bool – *True* if BigTIFF (64-bit offsets)
+        macro_entries   – list[IFDEntry] for the macro image
+        width, height   – macro dimensions (pixels)
+        spp, bps, cmp   – samples/pixel, bits/sample, compression
+
+    The function terminates the program via *fail()* if the slide is not a
+    TIFF or no macro image could be found.  It does **not** attempt to decode
+    the actual macro bitmap – that is left to the caller.
     """
+
     logging.basicConfig(
         level=logging.DEBUG if verbose else logging.INFO,
         format="%(levelname)s: %(message)s",
     )
+
     logging.info("Opening %s", input_path)
+
     try:
-        with open(input_path, "rb") as f:
-            data = bytearray(f.read())
+        with open(input_path, "rb") as fh:
+            data = bytearray(fh.read())
     except FileNotFoundError:
         fail(f"Input file not found: {input_path}")
-    except Exception as e:
-        fail(f"Error reading input file {input_path}: {e}")
+    except Exception as exc:
+        fail(f"Error reading input file {input_path}: {exc}")
 
-    # --- Detect byte order and classic vs BigTIFF -------------------------
+    # --- Detect byte order + classic vs BigTIFF -------------------------
     endian = {"II": "<", "MM": ">"}.get(data[:2].decode("ascii", "ignore"))
     if not endian:
         fail("Not a TIFF/SVS – could not determine byte order")
 
     magic = struct.unpack(endian + "H", data[2:4])[0]
-    bigtiff = magic == TIFF_MAGIC_BIG  # 43 => BigTIFF, 42 => classic
+    bigtiff = magic == TIFF_MAGIC_BIG  # 43 ⇒ BigTIFF, 42 ⇒ classic
 
     if bigtiff:
-        # BigTIFF header: bytes 4-6 contain offset size (should be 8) and reserved; first IFD offset is 8-byte @8
+        # BigTIFF header: bytes 4-6 contain offset size (should be 8) and
+        # reserved; first IFD offset is 8-byte @8
         ifd_off = struct.unpack(endian + "Q", data[8:16])[0]
     else:
         ifd_off = struct.unpack(endian + "I", data[4:8])[0]
 
-    macro = None
-    found_macro_ifd = False
+    macro_entries: list[IFDEntry] | None = None
+
     while ifd_off:
-        ent, nxt = read_ifd(data, ifd_off, endian, big=bigtiff)
-        desc = ascii_val(ent, TAG_IMAGE_DESCRIPTION, data, endian).lower()
+        entries, nxt = read_ifd(data, ifd_off, endian, big=bigtiff)
+        desc = ascii_val(entries, TAG_IMAGE_DESCRIPTION, data, endian).lower()
         if macro_description.lower() in desc:
-            macro = ent
-            found_macro_ifd = True
+            macro_entries = entries
             break
         ifd_off = nxt
-    if not found_macro_ifd:
-        logging.info(
-            "Macro image not found (description '%s') - skipping replacement.",
-            macro_description,
-        )
-        return
 
-    w = int_val(macro, TAG_IMAGE_WIDTH, data, endian)
-    h = int_val(macro, TAG_IMAGE_LENGTH, data, endian)
-    spp = int_val(macro, TAG_SAMPLES_PER_PIXEL, data, endian) or 3
-    bps = int_val(macro, TAG_BITS_PER_SAMPLE, data, endian) or 8
-    cmp = int_val(macro, TAG_COMPRESSION, data, endian) or 1
-    logging.debug("Macro: %dx%d, spp=%d, bps=%d, compression=%d", w, h, spp, bps, cmp)
+    if macro_entries is None:
+        fail("Macro image not found", description=macro_description)
 
-    # Many scanners store BitsPerSample as a pointer in BigTIFF where our
-    # quick reader may not resolve the array correctly.  As long as we can
-    # decode the macro thumbnail with OpenSlide we proceed even if the
-    # parsed *bps* value looks suspicious.  We only enforce that the macro
-    # is in RGB colour (three samples per pixel).
+    width = int_val(macro_entries, TAG_IMAGE_WIDTH, data, endian)
+    height = int_val(macro_entries, TAG_IMAGE_LENGTH, data, endian)
+    spp = int_val(macro_entries, TAG_SAMPLES_PER_PIXEL, data, endian) or 3
+    bps = int_val(macro_entries, TAG_BITS_PER_SAMPLE, data, endian) or 8
+    cmp = int_val(macro_entries, TAG_COMPRESSION, data, endian) or 1
+
+    logging.debug(
+        "Macro: %dx%d, spp=%d, bps=%d, compression=%d",
+        width,
+        height,
+        spp,
+        bps,
+        cmp,
+    )
+
     if spp != 3:
         fail("Unsupported macro format – need RGB samples_per_pixel=3", spp=spp)
 
-    img = load_macro_openslide(input_path)
-    if img is None:
-        fail("Unable to decode macro", compression=cmp)
+    return {
+        "data": data,
+        "endian": endian,
+        "bigtiff": bigtiff,
+        "macro_entries": macro_entries,
+        "width": width,
+        "height": height,
+        "spp": spp,
+        "bps": bps,
+        "cmp": cmp,
+    }
 
+
+def _write_slide_with_new_macro(
+    *,
+    info: dict,
+    img: Image.Image,
+    input_path: str,
+    output_path: str,
+    verbose: bool = False,
+):
+    """Patch *input_path* so that the macro image is replaced with *img*.
+
+    The heavy lifting for *replace_macro* and *replace_macro_with_image* lives
+    here so both variants share the exact same byte-level logic.
+    """
+
+    data: bytearray = info["data"]
+    endian: str = info["endian"]
+    bigtiff: bool = info["bigtiff"]
+    macro: list[IFDEntry] = info["macro_entries"]
+    w: int = info["width"]
+    h: int = info["height"]
+
+    # Ensure correct colour space & size ---------------------------------
     img = img.convert("RGB")
-
-    if rect_coords:
-        x0, y0, x1, y1 = rect_coords
-    else:
-        dw, dh = w // 4, h // 4
-        x0, y0 = (w - dw) // 2, (h - dh) // 2
-        x1, y1 = x0 + dw, y0 + dh
-    if not (0 <= x0 < x1 <= w and 0 <= y0 < y1 <= h):
-        fail(
-            "Rectangle outside image bounds",
-            rect=f"{x0},{y0},{x1},{y1}",
-            image=f"{w}x{h}",
+    if (img.width, img.height) != (w, h):
+        logging.debug(
+            "Resizing replacement image from %dx%d → %dx%d", img.width, img.height, w, h
         )
+        img = img.resize((w, h), Image.LANCZOS)
 
-    ImageDraw.Draw(img).rectangle([x0, y0, x1 - 1, y1 - 1], fill=fill_color)
-    logging.debug("Red rectangle drawn at %s", (x0, y0, x1, y1))
-
-    # ------------------------------------------------------------------
-    # Prepare new pixel data to be appended to the slide file.
-    # The new data is appended at the next aligned boundary so that
-    # existing offsets remain valid.
     buf = bytearray(img.tobytes())
+
     original_size = len(data)
     new_off = align(original_size, bigtiff)
     bc = len(buf)
 
-    # Helper closure for quick tag lookup in the macro IFD
+    # Helper for quick tag lookup in the macro IFD -----------------------
     def entry(tag):
         return next((e for e in macro if e.tag == tag), None)
 
-    # Track patches (position, packed_bytes) so we can apply them later
-    patches: list[tuple[int, bytes]] = []
+    patches: list[tuple[int, bytes]] = []  # (file_position, packed_bytes)
 
     def record_int_patch(e: IFDEntry, v: int):
         fmt = "Q" if e.big else "I"
@@ -354,12 +373,13 @@ def replace_macro(
         fmt = "Q" if e.big else "I"
         patches.append((e.count_pos, struct.pack(endian + fmt, c)))
 
-    # Apply the same modifications to the in-memory buffer *and* record them
+    # Set Compression=1 (uncompressed) & PhotometricInterpretation=2 (RGB)
     for tag, val in ((TAG_COMPRESSION, 1), (TAG_PHOTOMETRIC, 2)):
         if e := entry(tag):
             set_int(data, e, val, endian)
             record_int_patch(e, val)
 
+    # Update strip tags ---------------------------------------------------
     for tag, val in (
         (TAG_STRIP_OFFSETS, new_off),
         (TAG_STRIP_BYTE_COUNTS, bc),
@@ -375,29 +395,24 @@ def replace_macro(
         record_int_patch(e, val)
 
     # ------------------------------------------------------------------
-    # Create the output file efficiently.  First attempt to create a hard
-    # link so no data blocks are duplicated.  If linking is not possible
-    # (e.g. across filesystems), fall back to copying.
+    # Create the output file efficiently (hard-link fall-back copy) -----
     try:
         if os.path.exists(output_path):
             os.remove(output_path)
         os.link(input_path, output_path)
     except (OSError, AttributeError):
-        # Hard-link failed – fall back to shutil copy (slower and uses space)
         import shutil
 
         shutil.copy2(input_path, output_path)
 
     # ------------------------------------------------------------------
-    # Patch header fields in-place and append the new pixel data.
+    # Patch header + append new pixel buffer -----------------------------
     try:
         with open(output_path, "r+b") as fh:
-            # Apply header/value/count patches
             for pos, packed in patches:
                 fh.seek(pos)
                 fh.write(packed)
 
-            # Append padding (if any) + new pixel buffer at *new_off*
             fh.seek(0, os.SEEK_END)
             cur_size = fh.tell()
             if cur_size < new_off:
@@ -405,8 +420,94 @@ def replace_macro(
             fh.write(buf)
 
         logging.info("Saved %s", output_path)
-    except Exception as e:
-        fail(f"Error writing output file {output_path}: {e}")
+    except Exception as exc:
+        fail(f"Error writing output file {output_path}: {exc}")
+
+
+# ---------------------------------------------------------------------------
+# Public API ----------------------------------------------------------------
+
+
+def replace_macro(
+    input_path,
+    output_path,
+    rect_coords=None,
+    verbose=False,
+    macro_description="macro",
+    fill_color=(255, 0, 0),
+):
+    """High-level helper – redact the macro by drawing a rectangle.
+
+    This convenience wrapper keeps the original CLI behaviour intact while
+    delegating all heavy lifting to :func:`read_svs_macro_info` and
+    :func:`_write_slide_with_new_macro`.
+    """
+
+    # Gather metadata + verify slide ------------------------------------
+    info = read_svs_macro_info(
+        input_path, macro_description=macro_description, verbose=verbose
+    )
+
+    w = info["width"]
+    h = info["height"]
+
+    # Decode existing macro so we can paint the rectangle ---------------
+    img = load_macro_openslide(input_path)
+    if img is None:
+        fail("Unable to decode macro", compression=info["cmp"])
+    img = img.convert("RGB")
+
+    if rect_coords:
+        x0, y0, x1, y1 = rect_coords
+    else:
+        dw, dh = w // 4, h // 4
+        x0, y0 = (w - dw) // 2, (h - dh) // 2
+        x1, y1 = x0 + dw, y0 + dh
+
+    if not (0 <= x0 < x1 <= w and 0 <= y0 < y1 <= h):
+        fail(
+            "Rectangle outside image bounds",
+            rect=f"{x0},{y0},{x1},{y1}",
+            image=f"{w}x{h}",
+        )
+
+    ImageDraw.Draw(img).rectangle([x0, y0, x1 - 1, y1 - 1], fill=fill_color)
+    logging.debug("Rectangle drawn at %s", (x0, y0, x1, y1))
+
+    _write_slide_with_new_macro(
+        info=info,
+        img=img,
+        input_path=input_path,
+        output_path=output_path,
+        verbose=verbose,
+    )
+
+
+def replace_macro_with_image(
+    *,
+    input_path: str,
+    output_path: str,
+    replacement_img: "Image.Image",
+    verbose: bool = False,
+    macro_description: str = "macro",
+):
+    """Replace the macro thumbnail with *replacement_img*.
+
+    The *replacement_img* is converted to RGB and resized if necessary to the
+    dimensions of the original macro.
+    """
+
+    info = read_svs_macro_info(
+        input_path, macro_description=macro_description, verbose=verbose
+    )
+
+    _write_slide_with_new_macro(
+        info=info,
+        img=replacement_img,
+        input_path=input_path,
+        output_path=output_path,
+        verbose=verbose,
+    )
 
 
 if __name__ == "__main__":
