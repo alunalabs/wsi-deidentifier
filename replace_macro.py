@@ -559,4 +559,11 @@ if __name__ == "__main__":
     if rect_coords and len(rect_coords) != 4:
         parser.error("Rectangle requires 4 integer coordinates: x0 y0 x1 y1.")
 
-    replace_macro(inp_path, out_path, rect_coords, verbosity, macro_desc)
+    replace_macro(
+        inp_path,
+        out_path,
+        rect_coords,
+        verbosity,
+        macro_desc,
+        fill_color=(0, 0, 0),
+    )
