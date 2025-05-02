@@ -8,6 +8,7 @@ dependencies = [
   "google>=3.0.0",
   "google-cloud-vision>=3.10.1",
   "google-genai>=1.12.1",
+  "matplotlib>=3.10.1",
   "opencv-python>=4.11.0.86",
   "openslide-bin>=4.0.0.8",
   "openslide-python>=1.4.1",
