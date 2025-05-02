@@ -1,9 +1,9 @@
+import { SlideAnnotator } from "@/components/SlideAnnotator";
+import { getSlidesSlidesGetOptions } from "@/lib/api-client/@tanstack/react-query.gen";
 import { useQuery } from "@tanstack/react-query";
 import { Toaster } from "sonner";
-import { SlideAnnotator } from "./components/SlideAnnotator";
-import { getSlidesSlidesGetOptions } from "./lib/api-client/@tanstack/react-query.gen";
 
-export function App() {
+export default function Home() {
   const slidesQuery = useQuery(getSlidesSlidesGetOptions());
 
   if (slidesQuery.isLoading) {
@@ -30,5 +30,3 @@ export function App() {
     </div>
   );
 }
-
-export default App;
