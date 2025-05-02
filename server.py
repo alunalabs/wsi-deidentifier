@@ -57,6 +57,11 @@ class BoundingBoxInput(BaseModel):
             and isinstance(y1, int)
         ):
             raise ValueError("All coordinates must be integers.")
+
+        # Special case: Allow [0,0,0,0] for box deletion
+        if x0 == 0 and y0 == 0 and x1 == 0 and y1 == 0:
+            return v
+
         if x0 >= x1 or y0 >= y1:
             raise ValueError(
                 "Invalid coordinates: x0 must be less than x1, and y0 must be less than y1."
@@ -70,6 +75,7 @@ class BoundingBoxResponse(BaseModel):
     slide_filename: str = Field(..., description="The filename stem of the slide.")
     coords: List[int] = Field(
         default_factory=list,
+        min_length=0,  # Allow empty list for deleted boxes
         description="Bounding box coordinates [x0, y0, x1, y1]. Empty list if no box is set.",
     )
 
@@ -224,6 +230,14 @@ async def set_bounding_box(slide_filename: str, box_input: BoundingBoxInput):
         )
 
     # Basic validation is handled by Pydantic model BoundingBoxInput
+
+    # Special case for deletion ([0,0,0,0] coordinates)
+    if all(coord == 0 for coord in box_input.coords):
+        if slide_filename in boxes_store:
+            del boxes_store[slide_filename]
+            print(f"Deleted bounding box for {slide_filename}")
+        return BoundingBoxResponse(slide_filename=slide_filename, coords=[])
+
     # Store the validated coordinates
     boxes_store[slide_filename] = box_input.coords
     print(f"Stored bounding box for {slide_filename}: {box_input.coords}")

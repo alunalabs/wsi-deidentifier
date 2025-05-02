@@ -272,6 +272,29 @@ export const SlideAnnotator: React.FC<SlideAnnotatorProps> = ({
     }
   };
 
+  // --- Helper function to constrain box to image boundaries ---
+  const constrainBoxToImage = useCallback(
+    (box: Konva.RectConfig): Konva.RectConfig => {
+      if (!box) return box;
+
+      const x = Math.max(
+        0,
+        Math.min(box.x!, imageDimensions.width - box.width!)
+      );
+      const y = Math.max(
+        0,
+        Math.min(box.y!, imageDimensions.height - box.height!)
+      );
+
+      return {
+        ...box,
+        x,
+        y,
+      };
+    },
+    [imageDimensions]
+  ); // Add imageDimensions as dependency since it's used inside
+
   // Update box state when transformed
   const handleTransformEnd = useCallback(() => {
     const node = rectRef.current;
@@ -290,24 +313,93 @@ export const SlideAnnotator: React.FC<SlideAnnotatorProps> = ({
         height: Math.max(MIN_BOX_SIZE, node.height() * scaleY), // Enforce min size
         draggable: true, // Ensure still draggable
       };
-      setBox(newAttrs);
+
+      // Constrain box to image boundaries
+      const constrainedBox = constrainBoxToImage(newAttrs);
+      setBox(constrainedBox);
       setTransformerEnabled(true); // Keep transformer enabled after transform
     }
-  }, [box]); // Depend on box state
+  }, [box, constrainBoxToImage]); // Added imageDimensions dependency
 
   // Update box state when dragged
   const handleDragEnd = useCallback(
     (e: Konva.KonvaEventObject<DragEvent>) => {
       if (!box) return; // Should not happen if dragging, but safe check
-      setBox({
+
+      const draggedBox = {
         ...box,
         x: e.target.x(),
         y: e.target.y(),
-      });
+      };
+
+      // Constrain box to image boundaries
+      const constrainedBox = constrainBoxToImage(draggedBox);
+      setBox(constrainedBox);
       setTransformerEnabled(true); // Keep transformer enabled after drag
     },
-    [box] // Depend on box state
+    [box, constrainBoxToImage] // Added imageDimensions dependency
   );
+
+  // Constrain box during drag (not just at drag end)
+  const handleDragMove = useCallback(
+    (e: Konva.KonvaEventObject<DragEvent>) => {
+      const stage = e.target.getStage();
+      if (!stage || !box) return;
+
+      // Get current position
+      const x = e.target.x();
+      const y = e.target.y();
+
+      // Constrain to image boundaries
+      const newX = Math.max(0, Math.min(x, imageDimensions.width - box.width!));
+      const newY = Math.max(
+        0,
+        Math.min(y, imageDimensions.height - box.height!)
+      );
+
+      // Apply constraints during drag
+      e.target.position({ x: newX, y: newY });
+    },
+    [box, imageDimensions]
+  );
+
+  // Add Box button handler
+  const handleAddBox = useCallback(() => {
+    // Center the new box in the image
+    const boxWidth = Math.min(100, imageDimensions.width / 3);
+    const boxHeight = Math.min(100, imageDimensions.height / 3);
+    const x = (imageDimensions.width - boxWidth) / 2;
+    const y = (imageDimensions.height - boxHeight) / 2;
+
+    const newBox = {
+      x,
+      y,
+      width: boxWidth,
+      height: boxHeight,
+      stroke: BOX_COLOR,
+      strokeWidth: 2 / scale,
+      draggable: true,
+      id: `box-${slideStem}`,
+    };
+
+    setBox(newBox);
+    setTransformerEnabled(true); // Enable transformer for new box
+    toast.info("Box added. Adjust and save when ready.");
+  }, [imageDimensions, scale, slideStem]);
+
+  // Handle deleting the box
+  const handleDelete = useCallback(() => {
+    setBox(null);
+    setTransformerEnabled(false); // Disable transformer when box is removed
+
+    // Call API to delete box on the server
+    setBoxMutation.mutate({
+      path: { slide_filename: slideStem },
+      body: { coords: [0, 0, 0, 0] }, // Special value for deletion - handled by server
+    });
+
+    toast.info("Box deleted.");
+  }, [slideStem, setBoxMutation]);
 
   // Handle saving the current box
   const handleSave = useCallback(() => {
@@ -353,17 +445,6 @@ export const SlideAnnotator: React.FC<SlideAnnotatorProps> = ({
       body: { coords },
     });
   }, [box, scale, setBoxMutation, slideStem]);
-
-  // Handle deleting the box
-  const handleDelete = useCallback(() => {
-    setBox(null);
-    setTransformerEnabled(false); // Disable transformer when box is removed
-    // Optionally call API to delete box on server
-    // For now, we just clear it locally. User needs to 'Save' an empty box if backend needs it.
-    // A dedicated delete mutation could be added later.
-    // Example: deleteBoxMutation.mutate({ path: { slide_filename: slideStem } });
-    toast.info("Local box removed. Click 'Save Box' to persist deletion.");
-  }, []);
 
   // --- Rendering ---
 
@@ -432,6 +513,7 @@ export const SlideAnnotator: React.FC<SlideAnnotatorProps> = ({
                 // Click handled by stage mousedown now
                 // Tap handled by stage mousedown now
                 onDragEnd={handleDragEnd}
+                onDragMove={handleDragMove}
                 onTransformEnd={handleTransformEnd}
                 // Select box visually on hover (optional)
                 onMouseEnter={(e) => {
@@ -458,6 +540,21 @@ export const SlideAnnotator: React.FC<SlideAnnotatorProps> = ({
                   ) {
                     return oldBox;
                   }
+
+                  // Keep the transformer within the image bounds
+                  if (newBox.x < 0) {
+                    newBox.x = 0;
+                  }
+                  if (newBox.y < 0) {
+                    newBox.y = 0;
+                  }
+                  if (newBox.x + newBox.width > imageDimensions.width) {
+                    newBox.width = imageDimensions.width - newBox.x;
+                  }
+                  if (newBox.y + newBox.height > imageDimensions.height) {
+                    newBox.height = imageDimensions.height - newBox.y;
+                  }
+
                   return newBox;
                 }}
                 // Add resize handles configuration if needed (defaults are usually fine)
@@ -474,27 +571,38 @@ export const SlideAnnotator: React.FC<SlideAnnotatorProps> = ({
         </Stage>
       </div>
       <div className="mt-4 flex justify-end space-x-2">
-        {/* Keep Delete Button */}
+        {/* Add Box Button */}
+        {!box && (
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={handleAddBox}
+            disabled={setBoxMutation.isPending}
+          >
+            Add Box
+          </Button>
+        )}
+        {/* Delete Box Button */}
         {box && (
           <Button
-            variant="outline" // Changed variant for less emphasis
+            variant="destructive" // Changed to destructive for clarity
             size="sm"
             onClick={handleDelete}
             disabled={setBoxMutation.isPending}
           >
-            Clear Box
+            Delete Box
           </Button>
         )}
         {/* Save Button saves current state (box or no box) */}
-        <Button
-          onClick={handleSave}
-          // Allow saving even if box is null (to persist deletion)
-          // disabled={!box || setBoxMutation.isPending}
-          disabled={setBoxMutation.isPending}
-          size="sm"
-        >
-          {setBoxMutation.isPending ? "Saving..." : "Save Box"}
-        </Button>
+        {box && (
+          <Button
+            onClick={handleSave}
+            disabled={setBoxMutation.isPending}
+            size="sm"
+          >
+            {setBoxMutation.isPending ? "Saving..." : "Save Box"}
+          </Button>
+        )}
       </div>
       {/* Status messages */}
       {boxQuery.isLoading && (
