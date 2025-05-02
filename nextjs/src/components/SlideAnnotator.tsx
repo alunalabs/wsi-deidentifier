@@ -158,10 +158,18 @@ export const SlideAnnotator: React.FC<SlideAnnotatorProps> = ({
   // --- Event Handlers ---
 
   const handleMouseDown = (e: Konva.KonvaEventObject<MouseEvent>) => {
+    console.log("Mouse Down Event", {
+      target: e.target.name() || e.target.constructor.name,
+      isStage: e.target === e.target.getStage(),
+      existingBox: !!box,
+      isDrawing,
+    });
+
     // Ignore if clicking on the existing box or transformer
     if (e.target !== e.target.getStage()) {
       // If clicking the rectangle itself, enable the transformer
       if (rectRef.current && e.target === rectRef.current) {
+        console.log("Clicked on existing rectangle, enabling transformer");
         setTransformerEnabled(true);
       }
       return;
@@ -171,30 +179,39 @@ export const SlideAnnotator: React.FC<SlideAnnotatorProps> = ({
     // 1. Deselect current box (if any)
     setTransformerEnabled(false);
 
-    // 2. If no box exists, start drawing a new one
-    if (!box) {
-      const stage = e.target.getStage();
-      const pos = stage?.getPointerPosition();
-      if (!pos) return;
+    // 2. Start drawing a new box (regardless of whether one already exists)
+    const stage = e.target.getStage();
+    const pos = stage?.getPointerPosition();
+    console.log("Starting to draw new box at position:", pos);
+    if (!pos) return;
 
-      setIsDrawing(true);
-      drawingStartPos.current = pos; // Store start position
+    setIsDrawing(true);
+    drawingStartPos.current = pos; // Store start position
 
-      setBox({
-        x: pos.x,
-        y: pos.y,
-        width: 0,
-        height: 0,
-        stroke: BOX_COLOR,
-        strokeWidth: 2 / scale,
-        draggable: true,
-        id: `box-${slideStem}`,
-      });
-    }
+    // Replace existing box with new one
+    setBox({
+      x: pos.x,
+      y: pos.y,
+      width: 0,
+      height: 0,
+      stroke: BOX_COLOR,
+      strokeWidth: 2 / scale,
+      draggable: true,
+      id: `box-${slideStem}`,
+    });
+    console.log("Drawing state set:", {
+      isDrawing: true,
+      drawingStartPos: pos,
+    });
   };
 
   const handleMouseMove = (e: Konva.KonvaEventObject<MouseEvent>) => {
-    if (!isDrawing || !drawingStartPos.current) return;
+    if (!isDrawing || !drawingStartPos.current) {
+      // Only log occasionally to avoid flooding console
+      if (Math.random() < 0.05)
+        console.log("Mouse move with no drawing in progress");
+      return;
+    }
 
     const stage = e.target.getStage();
     const pos = stage?.getPointerPosition();
@@ -207,6 +224,12 @@ export const SlideAnnotator: React.FC<SlideAnnotatorProps> = ({
     const newWidth = Math.abs(pos.x - startPos.x);
     const newHeight = Math.abs(pos.y - startPos.y);
 
+    console.log("Mouse move during drawing:", {
+      currentPos: pos,
+      startPos,
+      newDimensions: { x: newX, y: newY, width: newWidth, height: newHeight },
+    });
+
     setBox((prevBox) => ({
       ...(prevBox as Konva.RectConfig),
       x: newX,
@@ -217,17 +240,30 @@ export const SlideAnnotator: React.FC<SlideAnnotatorProps> = ({
   };
 
   const handleMouseUp = () => {
+    console.log("Mouse Up Event", {
+      isDrawing,
+      drawingStartPos: drawingStartPos.current,
+      currentBox: box,
+    });
+
     if (isDrawing) {
       setIsDrawing(false);
       drawingStartPos.current = null;
 
       // Check if the drawn box is too small
       if (box && (box.width! < MIN_BOX_SIZE || box.height! < MIN_BOX_SIZE)) {
-        console.log("Drawn box too small, removing.");
+        console.log("Drawn box too small, removing.", {
+          width: box.width,
+          height: box.height,
+          minSize: MIN_BOX_SIZE,
+        });
         setBox(null); // Remove the tiny box
         setTransformerEnabled(false);
       } else if (box) {
         // Valid box drawn, enable transformer for it
+        console.log("Valid box drawn, enabling transformer", {
+          finalBox: box,
+        });
         setTransformerEnabled(true);
       }
     }
@@ -380,6 +416,7 @@ export const SlideAnnotator: React.FC<SlideAnnotatorProps> = ({
               image={konvaImage}
               width={imageDimensions.width}
               height={imageDimensions.height}
+              listening={false}
             />
           </Layer>
           <Layer ref={boxLayerRef}>
@@ -387,6 +424,7 @@ export const SlideAnnotator: React.FC<SlideAnnotatorProps> = ({
               <Rect
                 ref={rectRef}
                 {...box}
+                strokeScaleEnabled={false}
                 name="bounding-box" // Keep name for potential future use
                 // Click handled by stage mousedown now
                 // Tap handled by stage mousedown now
