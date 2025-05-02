@@ -49,8 +49,11 @@ import struct
 import sys
 from pathlib import Path
 
+import matplotlib.pyplot as plt
+from matplotlib.widgets import RectangleSelector
+
 import tiffparser
-from replace_macro import replace_macro
+from replace_macro import load_macro_openslide, replace_macro
 
 
 ###############################################################################
@@ -230,15 +233,21 @@ def process_slide(
     delete_associated_image(dst, "label")
     # strip_metadata(dst)
 
+    if rect_coords is not None and not _rect_is_valid(rect_coords):
+        rect_coords = None  # bad data
+
     if rect_coords is not None and macro_exists_in_source:
         print(f"  Attempting macro replacement ({macro_description}) in {dst}")
         try:
+            tmp_out = dst.with_suffix(dst.suffix + ".tmp")
             replace_macro(
                 str(dst),
-                str(dst),
+                str(tmp_out),
                 macro_description=macro_description,
                 rect_coords=rect_coords,
             )
+            # Atomic replace original file
+            tmp_out.replace(dst)
             print(f"  Successfully replaced macro in {dst}.")
         except Exception as e:
             print(
@@ -260,6 +269,123 @@ def process_slide(
             "dst_path": dst.resolve(),
         }
     )
+
+
+###############################################################################
+# Interactive labeling helper
+###############################################################################
+
+
+def interactive_label_slides(
+    slide_paths: list[Path],
+    boxes_by_path: dict,
+    macro_description: str,
+    boxes_json_path: Path,
+):
+    """Launch an interactive UI (matplotlib RectangleSelector) to label bounding boxes.
+
+    Already-labeled slides contained in *boxes_by_path* are skipped.  After each
+    successful annotation the JSON file at *boxes_json_path* is updated so that
+    progress is saved incrementally (important if the user aborts early).
+    """
+
+    slide_paths_sorted = sorted(slide_paths)
+
+    for slide in slide_paths_sorted:
+        slide_abs = str(slide.resolve())
+        if slide_abs in boxes_by_path:
+            # already labelled – skip
+            continue
+
+        print(f"\nInteractive annotation for: {slide}")
+        print(
+            "  Instructions:  Draw a rectangle covering PHI on the macro image, then\n"
+            "                press <Enter> to accept or close the window to skip."
+        )
+
+        # ------------------------------------------------------------------
+        # Load the macro thumbnail
+        # ------------------------------------------------------------------
+        try:
+            macro_img = load_macro_openslide(str(slide))
+        except Exception as exc:
+            print(f"  [warning] Could not load macro for {slide}: {exc}")
+            continue
+
+        if macro_img is None:
+            print("  [warning] No macro image embedded – skipping.")
+            continue
+
+        # Convert to RGB in case it is not
+        macro_img = macro_img.convert("RGB")
+
+        # ------------------------------------------------------------------
+        # Start an interactive Matplotlib session
+        # ------------------------------------------------------------------
+        coords = []  # will hold [x0, y0, x1, y1]
+
+        fig, ax = plt.subplots(figsize=(8, 8))
+        ax.imshow(macro_img)
+        ax.set_title(slide.name, fontsize=10)
+        ax.axis("off")
+
+        def onselect(eclick, erelease):
+            nonlocal coords
+            x0, y0 = int(eclick.xdata), int(eclick.ydata)
+            x1, y1 = int(erelease.xdata), int(erelease.ydata)
+            # normalise so x0<x1, y0<y1
+            x0, x1 = sorted((x0, x1))
+            y0, y1 = sorted((y0, y1))
+            coords = [x0, y0, x1, y1]
+
+        toggle_selector = RectangleSelector(
+            ax,
+            onselect,
+            useblit=True,
+            button=[1],  # left mouse button only
+            interactive=True,
+        )
+
+        def accept(event):
+            if event.key in ("enter", "return"):
+                plt.close(event.canvas.figure)
+
+        fig.canvas.mpl_connect("key_press_event", accept)
+
+        plt.show()
+
+        # ------------------------------------------------------------------
+        # Store annotation
+        # ------------------------------------------------------------------
+        if coords and coords[0] < coords[2] and coords[1] < coords[3]:
+            print(f"  Saved rectangle: {coords}")
+            boxes_by_path[slide_abs] = tuple(coords)
+        elif coords:
+            print(
+                "  Ignored zero-size rectangle (click rather than drag). Please drag to create a box."
+            )
+        # Write out to JSON after every annotation to be safe
+        try:
+            # store as list of dicts (legacy format)
+            records = [
+                {"file_path": p, "rect_coords": list(rc)}
+                for p, rc in boxes_by_path.items()
+            ]
+            with open(boxes_json_path, "w") as jf:
+                json.dump(records, jf, indent=2)
+            print(f"  JSON updated → {boxes_json_path}")
+        except Exception as exc:
+            print(f"  [warning] Could not update JSON file: {exc}")
+
+    return boxes_by_path
+
+
+def _rect_is_valid(rect: tuple[int, int, int, int] | list[int]) -> bool:
+    """Return True if rect coords are well-formed (x0<x1 and y0<y1)."""
+    if len(rect) != 4:
+        return False
+    x0, y0, x1, y1 = rect
+    return x1 > x0 and y1 > y0
 
 
 def main(argv=None):
@@ -287,30 +413,53 @@ def main(argv=None):
     )
     p.add_argument(
         "--boxes-json",
-        help="Path to a JSON file containing pre-identified bounding boxes for each file. Generated by identify_boxes.py.",
+        default="identified_boxes.json",
+        help=(
+            "Path to a JSON file containing bounding boxes (default: identified_boxes.json). If the file exists, its contents are loaded. "
+            "If interactive labeling is enabled (see --interactive-label) the same path will be updated with new annotations "
+            "after every slide is labeled."
+        ),
+    )
+    p.add_argument(
+        "--interactive-label",
+        action="store_true",
+        help=(
+            "Launch an interactive bounding-box labeling UI for slides that do not yet have annotations. "
+            "Progress is saved incrementally to the JSON file specified by --boxes-json (or 'identified_boxes.json' by default).",
+        ),
     )
     args = p.parse_args(argv)
 
     out_dir = Path(args.out)
     out_dir.mkdir(exist_ok=True)
 
-    boxes_by_path = {}
+    boxes_by_path: dict[str, tuple[int, int, int, int]] = {}
     if args.boxes_json:
         try:
-            with open(args.boxes_json, "r") as f:
-                boxes_data = json.load(f)
-                for item in boxes_data:
-                    file_path = item.get("file_path")
-                    rect_coords = item.get("rect_coords")
-                    if file_path and rect_coords:
-                        boxes_by_path[file_path] = tuple(rect_coords)
-                        print(f"Loaded bounding box for {file_path}: {rect_coords}")
+            if Path(args.boxes_json).is_file():
+                with open(args.boxes_json, "r") as f:
+                    boxes_data = json.load(f)
+                    for item in boxes_data:
+                        file_path = item.get("file_path")
+                        rect_coords = item.get("rect_coords")
+                        if file_path and rect_coords and _rect_is_valid(rect_coords):
+                            boxes_by_path[file_path] = tuple(rect_coords)
+                            print(f"Loaded bounding box for {file_path}: {rect_coords}")
+                        elif file_path and rect_coords:
+                            print(
+                                f"Ignored invalid rectangle in JSON for {file_path}: {rect_coords}",
+                                file=sys.stderr,
+                            )
+                    print(
+                        f"Loaded bounding boxes for {len(boxes_by_path)} files from {args.boxes_json}"
+                    )
+            else:
                 print(
-                    f"Loaded bounding boxes for {len(boxes_by_path)} files from {args.boxes_json}"
+                    f"No existing bounding-box JSON found at {args.boxes_json}. A new file will be created upon saving.",
+                    file=sys.stderr,
                 )
         except Exception as e:
             print(f"Error loading boxes JSON file: {e}", file=sys.stderr)
-            return
 
     mapping_exists = Path(args.map).is_file()
     with open(args.map, "a", newline="") as fp:
@@ -345,6 +494,22 @@ def main(argv=None):
                     all_paths.add(path)
 
         print(f"Found {len(all_paths)} unique files to process.")
+
+        # ------------------------------------------------------------------
+        # Interactive labeling (optional) ----------------------------------
+        # ------------------------------------------------------------------
+        if args.interactive_label:
+            if not all_paths:
+                print("No slides found for interactive labeling.")
+            else:
+                print("\n=== Interactive labeling mode enabled ===")
+                boxes_by_path = interactive_label_slides(
+                    slide_paths=list(all_paths),
+                    boxes_by_path=boxes_by_path,
+                    macro_description=args.macro_description,
+                    boxes_json_path=Path(args.boxes_json),
+                )
+                print("=== Labeling complete ===\n")
 
         if not all_paths:
             print("No files found matching the provided patterns.")
