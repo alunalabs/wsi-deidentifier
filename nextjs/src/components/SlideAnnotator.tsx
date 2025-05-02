@@ -42,6 +42,11 @@ export const SlideAnnotator: React.FC<SlideAnnotatorProps> = ({
   const [scale, setScale] = useState(1);
   const [isDrawing, setIsDrawing] = useState(false);
   const [box, setBox] = useState<Konva.RectConfig | null>(null);
+  const [initialBoxCoords, setInitialBoxCoords] = useState<number[] | null>(
+    null
+  ); // Store initial coords from API
+  const [isDirty, setIsDirty] = useState(false); // Track unsaved changes
+  const [isMarkedNoBoxNeeded, setIsMarkedNoBoxNeeded] = useState(false); // Track if marked as explicitly no box
   const [transformerEnabled, setTransformerEnabled] = useState(false); // Start with transformer disabled
   const [isReady, setIsReady] = useState(false); // Track if Konva is ready
   const stageRef = useRef<Konva.Stage>(null);
@@ -79,10 +84,11 @@ export const SlideAnnotator: React.FC<SlideAnnotatorProps> = ({
     ...setBoundingBoxBoxesSlideFilenamePutMutation(),
     onSuccess: () => {
       toast.success(`Box saved for ${slideStem}.`);
-      queryClient.invalidateQueries({
+      queryClient.refetchQueries({
         queryKey: getBoundingBoxBoxesSlideFilenameGetQueryKey({
           path: { slide_filename: slideStem },
         }),
+        exact: true, // Refetch this specific query only
       });
       setTransformerEnabled(true); // Keep selected after save
     },
@@ -110,7 +116,7 @@ export const SlideAnnotator: React.FC<SlideAnnotatorProps> = ({
     }
   }, [konvaImage]);
 
-  // Load existing box when query resolves and scale is known
+  // Load existing box OR "no box needed" state when query resolves and scale is known
   useEffect(() => {
     // Only attempt to load box when everything is ready
     if (
@@ -120,28 +126,68 @@ export const SlideAnnotator: React.FC<SlideAnnotatorProps> = ({
       scale > 0 &&
       !box &&
       !isDrawing // Don't load if currently drawing
+      // && !isDirty // Prevent reloading if there are local unsaved changes (might need adjustment)
     ) {
       const [x0, y0, x1, y1] = boxQuery.data.coords;
       console.log(`Loading existing box for ${slideStem}:`, [x0, y0, x1, y1]);
-      const loadedBox = {
-        x: x0 * scale,
-        y: y0 * scale,
-        width: (x1 - x0) * scale,
-        height: (y1 - y0) * scale,
-        stroke: BOX_COLOR,
-        strokeWidth: 2 / scale,
-        draggable: true,
-        id: `box-${slideStem}`,
-      };
-      // Only set if the box has valid dimensions
-      if (loadedBox.width >= MIN_BOX_SIZE && loadedBox.height >= MIN_BOX_SIZE) {
-        setBox(loadedBox);
-        setTransformerEnabled(false); // Load existing box without immediate selection
-      } else {
-        console.warn(`Loaded box for ${slideStem} is too small, ignoring.`);
+
+      // Store the initial state regardless of what it is
+      setInitialBoxCoords(boxQuery.data.coords);
+      setIsDirty(false); // Reset dirty state on load
+
+      // Handle "no box needed" state
+      if (x0 === -1 && y0 === -1 && x1 === -1 && y1 === -1) {
+        console.log(`Slide ${slideStem} marked as 'no box needed'.`);
+        setBox(null);
+        setIsMarkedNoBoxNeeded(true);
+        setTransformerEnabled(false);
+      }
+      // Handle actual box coordinates
+      else if (boxQuery.data.coords.length === 4) {
+        const loadedBox = {
+          x: x0 * scale,
+          y: y0 * scale,
+          width: (x1 - x0) * scale,
+          height: (y1 - y0) * scale,
+          stroke: BOX_COLOR,
+          strokeWidth: 2 / scale,
+          draggable: true,
+          id: `box-${slideStem}`,
+        };
+        // Only set if the box has valid dimensions
+        setIsMarkedNoBoxNeeded(false);
+        if (
+          loadedBox.width >= MIN_BOX_SIZE &&
+          loadedBox.height >= MIN_BOX_SIZE
+        ) {
+          setBox(loadedBox);
+          setTransformerEnabled(false); // Load existing box without immediate selection
+        } else {
+          console.warn(`Loaded box for ${slideStem} is too small, ignoring.`);
+          setBox(null); // Don't keep an invalid box
+        }
+      }
+      // Handle unlabeled state (empty coords)
+      else {
+        console.log(`Slide ${slideStem} is unlabeled.`);
+        setBox(null);
+        setIsMarkedNoBoxNeeded(false);
+        setTransformerEnabled(false);
       }
     }
-  }, [boxQuery.data, scale, slideStem, box, isDrawing, isReady]); // Added isReady dependency
+    // Reset dirty flag if query is loading or scale is not ready
+    else if (boxQuery.isLoading || !isReady) {
+      setIsDirty(false);
+    }
+  }, [
+    boxQuery.data,
+    boxQuery.isLoading,
+    scale,
+    slideStem,
+    box,
+    isDrawing,
+    isReady,
+  ]);
 
   // Attach transformer when box exists and is selected
   useEffect(() => {
@@ -158,15 +204,53 @@ export const SlideAnnotator: React.FC<SlideAnnotatorProps> = ({
     }
   }, [box, transformerEnabled]);
 
+  // --- Helper function to compare current box state with initial state ---
+  const checkDirtyState = useCallback(
+    (currentBox: Konva.RectConfig | null) => {
+      if (!scale || initialBoxCoords === null) return false; // Not ready or no initial state
+
+      if (isMarkedNoBoxNeeded) {
+        // If marked as no-box, it's dirty if the initial state wasn't also no-box
+        return !(
+          initialBoxCoords.length === 4 &&
+          initialBoxCoords.every((c) => c === -1)
+        );
+      }
+
+      if (currentBox === null) {
+        // If current box is null (unlabeled), it's dirty if the initial state wasn't also null/empty
+        return initialBoxCoords.length > 0;
+      }
+
+      // Compare coordinates if there's a current box
+      const x0 = Math.round(currentBox.x! / scale);
+      const y0 = Math.round(currentBox.y! / scale);
+      const x1 = Math.round((currentBox.x! + currentBox.width!) / scale);
+      const y1 = Math.round((currentBox.y! + currentBox.height!) / scale);
+      const currentCoords = [x0, y0, x1, y1];
+
+      if (
+        initialBoxCoords.length !== 4 ||
+        initialBoxCoords.some((c) => c === -1)
+      )
+        return true; // Initial was empty or no-box, now we have one
+
+      // Compare numerical arrays
+      return !currentCoords.every(
+        (val, index) => val === initialBoxCoords[index]
+      );
+    },
+    [initialBoxCoords, scale, isMarkedNoBoxNeeded]
+  );
+
   // --- Event Handlers ---
 
   const handleMouseDown = (e: Konva.KonvaEventObject<MouseEvent>) => {
-    console.log("Mouse Down Event", {
-      target: e.target.name() || e.target.constructor.name,
-      isStage: e.target === e.target.getStage(),
-      existingBox: !!box,
-      isDrawing,
-    });
+    // Prevent interaction if marked as no box needed
+    if (isMarkedNoBoxNeeded) {
+      console.log("Interaction disabled: Marked as 'no box needed'");
+      return;
+    }
 
     // Ignore if clicking on the existing box or transformer
     if (e.target !== e.target.getStage()) {
@@ -180,6 +264,7 @@ export const SlideAnnotator: React.FC<SlideAnnotatorProps> = ({
 
     // Clicking on stage background:
     // 1. Deselect current box (if any)
+    // Allow drawing even if a box exists (will replace it)
     setTransformerEnabled(false);
 
     // 2. Start drawing a new box (regardless of whether one already exists)
@@ -202,6 +287,8 @@ export const SlideAnnotator: React.FC<SlideAnnotatorProps> = ({
       draggable: true,
       id: `box-${slideStem}`,
     });
+    // Drawing a new box resets the "no box needed" state locally
+    setIsMarkedNoBoxNeeded(false);
     console.log("Drawing state set:", {
       isDrawing: true,
       drawingStartPos: pos,
@@ -209,10 +296,7 @@ export const SlideAnnotator: React.FC<SlideAnnotatorProps> = ({
   };
 
   const handleMouseMove = (e: Konva.KonvaEventObject<MouseEvent>) => {
-    if (!isDrawing || !drawingStartPos.current) {
-      // Only log occasionally to avoid flooding console
-      if (Math.random() < 0.05)
-        console.log("Mouse move with no drawing in progress");
+    if (!isDrawing || !drawingStartPos.current || isMarkedNoBoxNeeded) {
       return;
     }
 
@@ -227,12 +311,6 @@ export const SlideAnnotator: React.FC<SlideAnnotatorProps> = ({
     const newWidth = Math.abs(pos.x - startPos.x);
     const newHeight = Math.abs(pos.y - startPos.y);
 
-    console.log("Mouse move during drawing:", {
-      currentPos: pos,
-      startPos,
-      newDimensions: { x: newX, y: newY, width: newWidth, height: newHeight },
-    });
-
     setBox((prevBox) => ({
       ...(prevBox as Konva.RectConfig),
       x: newX,
@@ -243,12 +321,6 @@ export const SlideAnnotator: React.FC<SlideAnnotatorProps> = ({
   };
 
   const handleMouseUp = () => {
-    console.log("Mouse Up Event", {
-      isDrawing,
-      drawingStartPos: drawingStartPos.current,
-      currentBox: box,
-    });
-
     if (isDrawing) {
       setIsDrawing(false);
       drawingStartPos.current = null;
@@ -258,10 +330,12 @@ export const SlideAnnotator: React.FC<SlideAnnotatorProps> = ({
         console.log("Drawn box too small, removing.", {
           width: box.width,
           height: box.height,
+          boxStateBeforeRemove: box,
           minSize: MIN_BOX_SIZE,
         });
         setBox(null); // Remove the tiny box
         setTransformerEnabled(false);
+        setIsDirty(checkDirtyState(null)); // Check if removing makes it dirty
       } else if (box) {
         // Valid box drawn, enable transformer for it
         console.log("Valid box drawn, enabling transformer", {
@@ -269,6 +343,10 @@ export const SlideAnnotator: React.FC<SlideAnnotatorProps> = ({
         });
         setTransformerEnabled(true);
       }
+    }
+    // Update dirty state after potential box modification
+    if (isDrawing) {
+      setIsDirty(checkDirtyState(box));
     }
   };
 
@@ -317,14 +395,18 @@ export const SlideAnnotator: React.FC<SlideAnnotatorProps> = ({
       // Constrain box to image boundaries
       const constrainedBox = constrainBoxToImage(newAttrs);
       setBox(constrainedBox);
+      setIsDirty(checkDirtyState(constrainedBox));
       setTransformerEnabled(true); // Keep transformer enabled after transform
     }
-  }, [box, constrainBoxToImage]); // Added imageDimensions dependency
+  }, [box, constrainBoxToImage, checkDirtyState]); // Added imageDimensions dependency
 
   // Update box state when dragged
   const handleDragEnd = useCallback(
     (e: Konva.KonvaEventObject<DragEvent>) => {
       if (!box) return; // Should not happen if dragging, but safe check
+
+      // Prevent updates if marked as no box needed (shouldn't be draggable anyway)
+      if (isMarkedNoBoxNeeded) return;
 
       const draggedBox = {
         ...box,
@@ -335,32 +417,43 @@ export const SlideAnnotator: React.FC<SlideAnnotatorProps> = ({
       // Constrain box to image boundaries
       const constrainedBox = constrainBoxToImage(draggedBox);
       setBox(constrainedBox);
+      setIsDirty(checkDirtyState(constrainedBox));
       setTransformerEnabled(true); // Keep transformer enabled after drag
     },
-    [box, constrainBoxToImage] // Added imageDimensions dependency
+    [box, constrainBoxToImage, checkDirtyState, isMarkedNoBoxNeeded] // Added dependencies
   );
 
   // Constrain box during drag (not just at drag end)
   const handleDragMove = useCallback(
     (e: Konva.KonvaEventObject<DragEvent>) => {
+      // Prevent updates if marked as no box needed
+      if (isMarkedNoBoxNeeded) return;
+
       const stage = e.target.getStage();
-      if (!stage || !box) return;
+      // Use the current box state for width/height constraint checks
+      const currentBoxState = rectRef.current?.attrs as
+        | Konva.RectConfig
+        | undefined;
+      if (!stage || !currentBoxState) return;
 
       // Get current position
       const x = e.target.x();
       const y = e.target.y();
 
       // Constrain to image boundaries
-      const newX = Math.max(0, Math.min(x, imageDimensions.width - box.width!));
+      const newX = Math.max(
+        0,
+        Math.min(x, imageDimensions.width - currentBoxState.width!)
+      );
       const newY = Math.max(
         0,
-        Math.min(y, imageDimensions.height - box.height!)
+        Math.min(y, imageDimensions.height - currentBoxState.height!)
       );
 
       // Apply constraints during drag
       e.target.position({ x: newX, y: newY });
     },
-    [box, imageDimensions]
+    [imageDimensions, isMarkedNoBoxNeeded]
   );
 
   // Add Box button handler
@@ -383,26 +476,65 @@ export const SlideAnnotator: React.FC<SlideAnnotatorProps> = ({
     };
 
     setBox(newBox);
+    setIsDirty(checkDirtyState(newBox));
     setTransformerEnabled(true); // Enable transformer for new box
+    setIsMarkedNoBoxNeeded(false); // Adding a box clears the no-box state
     toast.info("Box added. Adjust and save when ready.");
-  }, [imageDimensions, scale, slideStem]);
+  }, [imageDimensions, scale, slideStem, checkDirtyState]);
 
   // Handle deleting the box
   const handleDelete = useCallback(() => {
+    const wasAlreadyUnlabeled =
+      initialBoxCoords === null || initialBoxCoords.length === 0;
+    setIsMarkedNoBoxNeeded(false); // Deleting means it's now unlabeled
     setBox(null);
     setTransformerEnabled(false); // Disable transformer when box is removed
 
-    // Call API to delete box on the server
-    setBoxMutation.mutate({
-      path: { slide_filename: slideStem },
-      body: { coords: [0, 0, 0, 0] }, // Special value for deletion - handled by server
-    });
+    const dirty = !wasAlreadyUnlabeled;
+    setIsDirty(dirty);
 
-    toast.info("Box deleted.");
-  }, [slideStem, setBoxMutation]);
+    // Only call mutation if the state actually changed
+    if (dirty) {
+      setBoxMutation.mutate({
+        path: { slide_filename: slideStem },
+        body: { coords: [0, 0, 0, 0] }, // Special value for deletion -> unlabeled
+      });
+      toast.info("Box deleted. Saving...");
+    } else {
+      toast.info("Already unlabeled.");
+    }
+  }, [slideStem, setBoxMutation, initialBoxCoords]);
+
+  // Handle marking as "No Box Needed"
+  const handleMarkNoBoxNeeded = useCallback(() => {
+    const wasAlreadyMarked = initialBoxCoords?.every((c) => c === -1);
+    setIsMarkedNoBoxNeeded(true);
+    setBox(null); // Visually remove box
+    setTransformerEnabled(false);
+
+    const dirty = !wasAlreadyMarked;
+    setIsDirty(dirty);
+
+    // Only call mutation if the state actually changed
+    if (dirty) {
+      setBoxMutation.mutate({
+        path: { slide_filename: slideStem },
+        body: { coords: [-1, -1, -1, -1] }, // Special value for no box needed
+      });
+      toast.info("Marked as 'No Box Needed'. Saving...");
+    } else {
+      toast.info("Already marked as 'No Box Needed'.");
+    }
+  }, [slideStem, setBoxMutation, initialBoxCoords]);
 
   // Handle saving the current box
   const handleSave = useCallback(() => {
+    if (isMarkedNoBoxNeeded || !box) {
+      toast.error(
+        "Cannot save, no box present. Use 'Delete Box' or 'No Box Needed'."
+      );
+      return;
+    }
     if (!box || !rectRef.current || !scale) {
       toast.error("No valid box to save.");
       return;
@@ -444,7 +576,7 @@ export const SlideAnnotator: React.FC<SlideAnnotatorProps> = ({
       path: { slide_filename: slideStem },
       body: { coords },
     });
-  }, [box, scale, setBoxMutation, slideStem]);
+  }, [box, scale, setBoxMutation, slideStem, isMarkedNoBoxNeeded]);
 
   // --- Rendering ---
 
@@ -468,19 +600,64 @@ export const SlideAnnotator: React.FC<SlideAnnotatorProps> = ({
   return (
     <div className="border p-4 rounded-lg shadow-md flex flex-col">
       <h3 className="text-lg font-semibold mb-2 truncate" title={slideStem}>
-        {slideStem}
+        {slideStem} {isDirty && <span className="text-orange-500 ml-1">*</span>}
       </h3>
+      {/* Status Indicator */}
+      <div className="text-sm text-gray-500 mb-2">
+        Status:{" "}
+        {boxQuery.isLoading ? (
+          <span className="italic">Loading...</span>
+        ) : isMarkedNoBoxNeeded ? (
+          <span className="text-blue-600 font-medium">
+            Marked &apos;No Box Needed&apos;{" "}
+            {isDirty ? (
+              <span className="text-orange-500 font-normal italic">
+                (unsaved)
+              </span>
+            ) : (
+              <span className="text-green-600 font-normal italic">(saved)</span>
+            )}
+          </span>
+        ) : box ? (
+          <span className="text-green-600 font-medium">
+            Box Present{" "}
+            {isDirty ? (
+              <span className="text-orange-500 font-normal italic">
+                (unsaved)
+              </span>
+            ) : (
+              <span className="text-green-600 font-normal italic">(saved)</span>
+            )}
+          </span>
+        ) : (
+          <span className="text-gray-600 font-medium">
+            Unlabeled{" "}
+            {isDirty ? (
+              <span className="text-orange-500 font-normal italic">
+                (unsaved)
+              </span>
+            ) : (
+              <span className="text-green-600 font-normal italic">(saved)</span>
+            )}
+          </span>
+        )}
+      </div>
       {/* Updated Instructions */}
       <p className="text-sm text-gray-500 mb-2">
-        Click and drag on empty space to draw a box. Click the box to
-        select/transform.
+        {!isMarkedNoBoxNeeded
+          ? "Click/drag on empty space to draw. Click box to select/transform."
+          : "This slide is marked as not needing a box."}
       </p>
       <div
         style={{
           width: imageDimensions.width,
           height: imageDimensions.height,
           margin: "0 auto",
-          cursor: !box && !isDrawing ? "crosshair" : "default", // Indicate draw possibility
+          cursor: isMarkedNoBoxNeeded
+            ? "not-allowed"
+            : !box && !isDrawing
+            ? "crosshair"
+            : "default", // Indicate draw possibility or restriction
         }}
         className="relative bg-gray-200"
       >
@@ -490,8 +667,6 @@ export const SlideAnnotator: React.FC<SlideAnnotatorProps> = ({
           onMouseDown={handleMouseDown}
           onMouseMove={handleMouseMove}
           onMouseUp={handleMouseUp}
-          // onClick={handleStageClick} // handleMouseDown now handles stage clicks
-          // onTap={handleStageClick} // handleMouseDown now handles stage taps
           ref={stageRef}
           style={{ background: "#f0f0f0" }}
         >
@@ -510,13 +685,14 @@ export const SlideAnnotator: React.FC<SlideAnnotatorProps> = ({
                 {...box}
                 strokeScaleEnabled={false}
                 name="bounding-box" // Keep name for potential future use
-                // Click handled by stage mousedown now
-                // Tap handled by stage mousedown now
+                // Only allow interactions if not marked as no box needed
+                draggable={!isMarkedNoBoxNeeded}
                 onDragEnd={handleDragEnd}
                 onDragMove={handleDragMove}
                 onTransformEnd={handleTransformEnd}
                 // Select box visually on hover (optional)
                 onMouseEnter={(e) => {
+                  if (isMarkedNoBoxNeeded) return;
                   const container = e.target.getStage()?.container();
                   if (container) container.style.cursor = "pointer";
                 }}
@@ -601,6 +777,17 @@ export const SlideAnnotator: React.FC<SlideAnnotatorProps> = ({
             size="sm"
           >
             {setBoxMutation.isPending ? "Saving..." : "Save Box"}
+          </Button>
+        )}
+        {/* Mark No Box Needed Button */}
+        {!box && (
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={handleMarkNoBoxNeeded}
+            disabled={setBoxMutation.isPending || isMarkedNoBoxNeeded}
+          >
+            No Box Needed
           </Button>
         )}
       </div>

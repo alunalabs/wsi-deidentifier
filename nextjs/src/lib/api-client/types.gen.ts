@@ -24,7 +24,7 @@ export type BoundingBoxResponse = {
      */
     slide_filename: string;
     /**
-     * Bounding box coordinates [x0, y0, x1, y1]. Empty list if no box is set.
+     * Bounding box coordinates [x0, y0, x1, y1]. Empty list if no box is set. [-1,-1,-1,-1] if marked as 'no box needed'.
      */
     coords?: Array<number>;
 };
@@ -138,6 +138,24 @@ export type SetBoundingBoxBoxesSlideFilenamePutResponses = {
 };
 
 export type SetBoundingBoxBoxesSlideFilenamePutResponse = SetBoundingBoxBoxesSlideFilenamePutResponses[keyof SetBoundingBoxBoxesSlideFilenamePutResponses];
+
+export type GetBoxesStatusBoxesStatusGetData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/boxes/status';
+};
+
+export type GetBoxesStatusBoxesStatusGetResponses = {
+    /**
+     * Successful Response
+     */
+    200: {
+        [key: string]: string;
+    };
+};
+
+export type GetBoxesStatusBoxesStatusGetResponse = GetBoxesStatusBoxesStatusGetResponses[keyof GetBoxesStatusBoxesStatusGetResponses];
 
 export type GetSlideImageSlidesSlideFilenameImageGetData = {
     body?: never;

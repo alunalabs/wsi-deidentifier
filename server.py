@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import base64
 import io
+import json
 import os
 import re
 import sys
@@ -12,7 +13,7 @@ import openslide
 from fastapi import FastAPI, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
 from PIL import Image
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field
 
 # --- Globals / State ---
 
@@ -20,8 +21,10 @@ from pydantic import BaseModel, Field, field_validator
 slide_paths: List[Path] = []
 # Maps filename stem to Path object
 filename_to_path: Dict[str, Path] = {}
-# In-memory storage for bounding boxes (filename_stem -> [x0, y0, x1, y1])
+# In-memory storage for bounding boxes (filename_stem -> [x0, y0, x1, y1] or [-1,-1,-1,-1] for no-box-needed)
 boxes_store: Dict[str, List[int]] = {}
+# Path for persisting boxes
+PERSIST_JSON_PATH: Path | None = None
 
 
 # --- Pydantic Models ---
@@ -43,30 +46,33 @@ class BoundingBoxInput(BaseModel):
         description="Bounding box coordinates [x0, y0, x1, y1].",
     )
 
-    @field_validator("coords")
-    @classmethod
-    def validate_coords(cls, v: List[int]) -> List[int]:
-        if len(v) != 4:
-            # This check is technically redundant due to min/max_length, but good practice
-            raise ValueError("Coordinates list must contain exactly 4 integers.")
-        x0, y0, x1, y1 = v
-        if not (
-            isinstance(x0, int)
-            and isinstance(y0, int)
-            and isinstance(x1, int)
-            and isinstance(y1, int)
-        ):
-            raise ValueError("All coordinates must be integers.")
+    # Removing the validation constraint x0<x1, y0<y1 here, will validate in the endpoint after checking special values
+    # @field_validator("coords")
+    # @classmethod
+    # def validate_coords(cls, v: List[int]) -> List[int]:
+    #     if len(v) != 4:
+    #         # This check is technically redundant due to min/max_length, but good practice
+    #         raise ValueError("Coordinates list must contain exactly 4 integers.")
+    #     x0, y0, x1, y1 = v
+    #     if not (
+    #         isinstance(x0, int)
+    #         and isinstance(y0, int)
+    #         and isinstance(x1, int)
+    #         and isinstance(y1, int)
+    #     ):
+    #         raise ValueError("All coordinates must be integers.")
 
-        # Special case: Allow [0,0,0,0] for box deletion
-        if x0 == 0 and y0 == 0 and x1 == 0 and y1 == 0:
-            return v
+    #     # Special case: Allow [0,0,0,0] for box deletion
+    #     # Special case: Allow [-1,-1,-1,-1] for "no box needed"
+    #     if v == [0, 0, 0, 0] or v == [-1, -1, -1, -1]:
+    #         return v
 
-        if x0 >= x1 or y0 >= y1:
-            raise ValueError(
-                "Invalid coordinates: x0 must be less than x1, and y0 must be less than y1."
-            )
-        return v
+    #     # Validation moved to endpoint logic
+    #     # if x0 >= x1 or y0 >= y1:
+    #     #     raise ValueError(
+    #     #         "Invalid coordinates: x0 must be less than x1, and y0 must be less than y1."
+    #     #     )
+    #     return v
 
 
 class BoundingBoxResponse(BaseModel):
@@ -75,8 +81,8 @@ class BoundingBoxResponse(BaseModel):
     slide_filename: str = Field(..., description="The filename stem of the slide.")
     coords: List[int] = Field(
         default_factory=list,
-        min_length=0,  # Allow empty list for deleted boxes
-        description="Bounding box coordinates [x0, y0, x1, y1]. Empty list if no box is set.",
+        min_length=0,  # Allow empty list for deleted boxes or [-1,-1,-1,-1]
+        description="Bounding box coordinates [x0, y0, x1, y1]. Empty list if no box is set. [-1,-1,-1,-1] if marked as 'no box needed'.",
     )
 
 
@@ -131,6 +137,78 @@ def _find_slides(pattern: str) -> None:
     #     print(f"  - {stem}: {path}")
 
 
+def _load_boxes():
+    """Loads boxes from the JSON file defined by PERSIST_JSON_PATH."""
+    global boxes_store
+    if PERSIST_JSON_PATH and PERSIST_JSON_PATH.exists():
+        print(f"Loading existing boxes from {PERSIST_JSON_PATH}")
+        try:
+            with open(PERSIST_JSON_PATH, "r") as f:
+                loaded_data = json.load(f)
+                # Basic validation: ensure it's a dictionary and values are lists of 4 ints
+                if isinstance(loaded_data, dict):
+                    valid_data = {}
+                    invalid_count = 0
+                    for k, v in loaded_data.items():
+                        if (
+                            isinstance(v, list)
+                            and len(v) == 4
+                            and all(isinstance(i, int) for i in v)
+                        ):
+                            valid_data[k] = v
+                        else:
+                            invalid_count += 1
+                            print(
+                                f"Warning: Invalid data format for key '{k}' in {PERSIST_JSON_PATH}. Skipping.",
+                                file=sys.stderr,
+                            )
+                    boxes_store = valid_data
+                    if invalid_count > 0:
+                        print(
+                            f"Warning: Skipped {invalid_count} invalid entries from {PERSIST_JSON_PATH}.",
+                            file=sys.stderr,
+                        )
+                    print(f"Loaded {len(boxes_store)} box entries.")
+                else:
+                    print(
+                        f"Warning: Invalid format in {PERSIST_JSON_PATH}. Expected a JSON object. Starting with empty store.",
+                        file=sys.stderr,
+                    )
+                    boxes_store = {}
+        except json.JSONDecodeError:
+            print(
+                f"Error: Could not decode JSON from {PERSIST_JSON_PATH}. Starting with empty store.",
+                file=sys.stderr,
+            )
+            boxes_store = {}
+        except Exception as e:
+            print(
+                f"Error loading boxes from {PERSIST_JSON_PATH}: {e}. Starting with empty store.",
+                file=sys.stderr,
+            )
+            boxes_store = {}
+    else:
+        print(
+            "Persistence file not found or not specified. Starting with empty box store."
+        )
+        boxes_store = {}
+
+
+def _save_boxes():
+    """Saves the current boxes_store to the JSON file defined by PERSIST_JSON_PATH."""
+    if PERSIST_JSON_PATH:
+        print(f"Saving {len(boxes_store)} box entries to {PERSIST_JSON_PATH}")
+        try:
+            # Ensure parent directory exists
+            PERSIST_JSON_PATH.parent.mkdir(parents=True, exist_ok=True)
+            with open(PERSIST_JSON_PATH, "w") as f:
+                json.dump(boxes_store, f, indent=2)  # Use indent for readability
+        except Exception as e:
+            print(f"Error saving boxes to {PERSIST_JSON_PATH}: {e}", file=sys.stderr)
+    else:
+        print("Skipping box persistence: PERSIST_JSON_PATH not set.")
+
+
 # --- FastAPI Lifecycle ---
 
 
@@ -146,12 +224,25 @@ async def lifespan(app: FastAPI):
         print("Shutting down server.")
         return
 
+    global PERSIST_JSON_PATH
+    persist_path_str = os.environ.get("PERSIST_JSON_PATH")
+    if persist_path_str:
+        PERSIST_JSON_PATH = Path(persist_path_str).resolve()
+        print(
+            f"Persistence enabled. Boxes will be loaded/saved at: {PERSIST_JSON_PATH}"
+        )
+    else:
+        print(
+            "Warning: PERSIST_JSON_PATH environment variable not set. Box data will not be persisted.",
+            file=sys.stderr,
+        )
+
     _find_slides(slide_pattern)
-    # TODO: Optionally load existing boxes from a file here
+    _load_boxes()  # Load existing boxes from file
     print("Server startup complete.")
     yield
     # Shutdown
-    # TODO: Optionally save boxes to a file here
+    _save_boxes()  # Save boxes on shutdown
     print("Shutting down server.")
 
 
@@ -213,7 +304,7 @@ async def get_bounding_box(slide_filename: str):
     response_model=BoundingBoxResponse,
     status_code=status.HTTP_200_OK,  # Use 200 for update, 201 for creation (optional distinction)
     summary="Set or Update Bounding Box",
-    description="Sets or updates the bounding box coordinates for a given slide filename (stem).",
+    description="Sets or updates the bounding box coordinates for a given slide filename (stem). Use coords [0,0,0,0] to delete (mark as unlabeled), and [-1,-1,-1,-1] to mark as 'no box needed'.",
     responses={
         status.HTTP_404_NOT_FOUND: {"description": "Slide not found"},
         status.HTTP_422_UNPROCESSABLE_ENTITY: {
@@ -229,20 +320,66 @@ async def set_bounding_box(slide_filename: str, box_input: BoundingBoxInput):
             detail=f"Slide '{slide_filename}' not found and cannot set box.",
         )
 
-    # Basic validation is handled by Pydantic model BoundingBoxInput
+    # Basic type/length validation is handled by Pydantic model BoundingBoxInput
+    coords = box_input.coords
 
-    # Special case for deletion ([0,0,0,0] coordinates)
-    if all(coord == 0 for coord in box_input.coords):
+    # Special case for deletion ([0,0,0,0] coordinates) -> Mark as unlabeled
+    if coords == [0, 0, 0, 0]:
         if slide_filename in boxes_store:
             del boxes_store[slide_filename]
-            print(f"Deleted bounding box for {slide_filename}")
+            print(
+                f"Deleted bounding box entry for {slide_filename} (marked as unlabeled)."
+            )
+            _save_boxes()  # Persist change
         return BoundingBoxResponse(slide_filename=slide_filename, coords=[])
 
-    # Store the validated coordinates
-    boxes_store[slide_filename] = box_input.coords
-    print(f"Stored bounding box for {slide_filename}: {box_input.coords}")
+    # Special case for "No box needed" ([-1,-1,-1,-1] coordinates)
+    elif coords == [-1, -1, -1, -1]:
+        boxes_store[slide_filename] = coords
+        print(f"Marked {slide_filename} as 'no box needed'.")
+        _save_boxes()  # Persist change
+        return BoundingBoxResponse(slide_filename=slide_filename, coords=coords)
 
-    return BoundingBoxResponse(slide_filename=slide_filename, coords=box_input.coords)
+    # Normal box - Perform additional validation
+    else:
+        x0, y0, x1, y1 = coords
+        if x0 >= x1 or y0 >= y1:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="Invalid coordinates: x0 must be less than x1, and y0 must be less than y1.",
+            )
+
+        # Store the validated coordinates
+        boxes_store[slide_filename] = coords
+        print(f"Stored bounding box for {slide_filename}: {coords}")
+        _save_boxes()  # Persist change
+        return BoundingBoxResponse(slide_filename=slide_filename, coords=coords)
+
+
+@app.get(
+    "/boxes/status",
+    response_model=Dict[str, str],
+    summary="Get Status of All Boxes",
+    description="Returns the annotation status for all known slides ('labeled', 'unlabeled', 'no_box_needed').",
+)
+async def get_boxes_status():
+    """Calculates and returns the status of each slide based on boxes_store."""
+    status_map = {}
+    for filename in filename_to_path.keys():
+        if filename in boxes_store:
+            coords = boxes_store[filename]
+            if coords == [-1, -1, -1, -1]:
+                status_map[filename] = "no_box_needed"
+            elif (
+                isinstance(coords, list) and len(coords) == 4
+            ):  # Assume valid box otherwise
+                status_map[filename] = "labeled"
+            else:
+                # Should not happen with current logic, but handle defensively
+                status_map[filename] = "unlabeled"  # Treat unexpected data as unlabeled
+        else:
+            status_map[filename] = "unlabeled"
+    return status_map
 
 
 @app.get(
@@ -334,6 +471,11 @@ if __name__ == "__main__":
         )
         # Set a default or raise error if needed when run directly
         # os.environ["SLIDE_PATTERN"] = "sample/identified/*.svs" # Example default
+    if not os.environ.get("PERSIST_JSON_PATH"):
+        print(
+            "Warning: PERSIST_JSON_PATH not set. Box data will not be persisted if run this way.",
+            file=sys.stderr,
+        )
 
     # Note: Lifespan events work better with uvicorn CLI runner
     uvicorn.run(
