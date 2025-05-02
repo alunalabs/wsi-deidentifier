@@ -1,24 +1,36 @@
+[build-system]
+requires = ["setuptools>=42"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "wsi-deidentifier"
 version = "0.1.0"
-description = "Add your description here"
+description = "Tool to deidentify whole slide images by removing PHI"
 readme = "README.md"
-requires-python = ">=3.10.0"
+authors = [{ name = "Lawrence Chen", email = "lawrencechan27@gmail.com" }]
+license = "MIT"
+classifiers = ["Programming Language :: Python :: 3.10"]
+requires-python = ">=3.10"
 dependencies = [
-  "fastapi[all]>=0.115.12",
-  "google>=3.0.0",
-  "google-cloud-vision>=3.10.1",
-  "google-genai>=1.12.1",
-  "matplotlib>=3.10.1",
-  "opencv-python>=4.11.0.86",
-  "openslide-bin>=4.0.0.8",
-  "openslide-python>=1.4.1",
-  "pillow>=11.2.1",
-  "pylibdmtx>=0.1.10",
-  "pytesseract>=0.3.13",
-  "pyzbar>=0.1.9",
-  "tifffile>=2025.3.30",
-  "tinynumpy>=1.2.1",
+  "click",
+  "numpy",
+  "Pillow",
+  "opencv-python",
+  "openslide-python",
+  "openslide-bin",
+  "pyzbar",
+  "pylibdmtx",
+  "tifffile",
+  "pytesseract",
+  "azure-storage-blob",
+  "fastapi",
+  "uvicorn",
 ]
+
+[project.scripts]
+wsi-deidentifier = "wsi_deidentifier.deidentify:main"
+
+[tool.setuptools]
+packages = ["wsi_deidentifier"]
 
 [tool.uv]

@@ -58,6 +58,27 @@ The `start.sh` script provides simple directory options and more advanced config
 ./start.sh run -v /path/to/slides:/app/sample/identified -v /path/to/output:/app/deidentified
 ```
 
+## Azure Blob Storage Support
+
+The tool supports using Azure Blob Storage for both source and destination slides using SAS URLs:
+
+```bash
+# Run with Azure Blob Storage as source
+./start.sh run --dir="https://youraccount.blob.core.windows.net/source-container?sv=2022-11-02&..." \
+               --out=./deidentified
+
+# Use Azure for both source and destination
+./start.sh run --dir="https://youraccount.blob.core.windows.net/source-container?sv=2022-11-02&..." \
+               --out="https://youraccount.blob.core.windows.net/output-container?sv=2022-11-02&..."
+```
+
+For Azure SAS URLs:
+
+- Make sure your SAS token has appropriate permissions (read for source, write for destination)
+- You can include wildcards in the source URL path to filter specific files
+- Performance may be slower due to network transfer times
+- Files are cached locally during processing and cleaned up afterward
+
 ## Example Docker Command for Production
 
 ```bash

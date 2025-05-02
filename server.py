@@ -5,11 +5,16 @@ import json
 import os
 import re
 import sys
+import tempfile
+import urllib.parse
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Tuple
 
 import openslide
+
+# Add Azure dependencies
+from azure.storage.blob import BlobClient, BlobServiceClient, ContainerClient
 from fastapi import FastAPI, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
 from PIL import Image
@@ -21,14 +26,211 @@ from replace_macro import replace_macro
 
 # Will store Path objects for found slides
 slide_paths: List[Path] = []
-# Maps filename stem to Path object
-filename_to_path: Dict[str, Path] = {}
+# Maps filename stem to Path object or Azure blob URL
+filename_to_path: Dict[str, Path | str] = {}
 # In-memory storage for bounding boxes (filename_stem -> [x0, y0, x1, y1] or [-1,-1,-1,-1] for no-box-needed)
 boxes_store: Dict[str, List[int]] = {}
 # Path for persisting boxes
 PERSIST_JSON_PATH: Path | None = None
-# Directory for deidentified slides
-DEIDENTIFIED_DIR: Path | None = None
+# Directory for deidentified slides (can be local path or Azure SAS URL)
+DEIDENTIFIED_DIR: Path | str | None = None
+
+
+# --- Azure Storage Helpers ---
+
+
+def is_azure_sas_url(url: str) -> bool:
+    """Check if a string is an Azure Blob Storage SAS URL."""
+    return (
+        url.startswith("https://") and "blob.core.windows.net" in url and "sv=" in url
+    )
+
+
+def parse_azure_sas_url(sas_url: str) -> Tuple[str, str, str, str]:
+    """
+    Parse an Azure SAS URL into its components.
+    Returns: (account_name, container_name, blob_path, sas_token)
+    """
+    parsed_url = urllib.parse.urlparse(sas_url)
+
+    # Extract account name from the hostname
+    account_name = parsed_url.netloc.split(".")[0]
+
+    # Extract container name and blob path
+    path_parts = parsed_url.path.strip("/").split("/")
+    container_name = path_parts[0] if path_parts else ""
+    blob_path = "/".join(path_parts[1:]) if len(path_parts) > 1 else ""
+
+    # Extract SAS token (everything after the '?')
+    sas_token = parsed_url.query
+
+    return account_name, container_name, blob_path, sas_token
+
+
+def get_container_client_from_sas(sas_url: str) -> ContainerClient:
+    """Get a container client from a SAS URL."""
+    account_name, container_name, _, sas_token = parse_azure_sas_url(sas_url)
+
+    # Construct the account URL
+    account_url = f"https://{account_name}.blob.core.windows.net"
+
+    # Create a BlobServiceClient using the account URL and SAS token
+    blob_service_client = BlobServiceClient(
+        account_url=account_url, credential=sas_token
+    )
+
+    # Get the container client
+    container_client = blob_service_client.get_container_client(container_name)
+
+    return container_client
+
+
+def list_azure_blobs(sas_url: str, pattern: str = "*.{svs,tif,tiff}") -> List[str]:
+    """
+    List blobs in Azure container matching the given pattern.
+    Returns full SAS URLs for each matching blob.
+    """
+    # Extract parts from the SAS URL
+    account_name, container_name, prefix_path, sas_token = parse_azure_sas_url(sas_url)
+
+    # Get container client
+    container_client = get_container_client_from_sas(sas_url)
+
+    # Convert glob pattern to regex for filtering
+    # This is a simplified version - may need enhancement for complex patterns
+    pattern_regex = (
+        pattern.replace(".", "\\.")
+        .replace("*", ".*")
+        .replace("{", "(")
+        .replace("}", ")")
+        .replace(",", "|")
+    )
+    regex = re.compile(pattern_regex)
+
+    # List blobs with the prefix
+    matching_blobs = []
+    try:
+        # List all blobs if prefix is empty, otherwise use the prefix
+        blobs = container_client.list_blobs(name_starts_with=prefix_path)
+
+        # Filter blobs by pattern and construct full SAS URLs
+        base_url = f"https://{account_name}.blob.core.windows.net/{container_name}"
+
+        for blob in blobs:
+            # Extract just the filename for pattern matching
+            blob_name = blob.name
+            if prefix_path:
+                # Remove prefix for pattern matching if it exists
+                relative_path = (
+                    blob_name[len(prefix_path) :]
+                    if blob_name.startswith(prefix_path)
+                    else blob_name
+                )
+            else:
+                relative_path = blob_name
+
+            if regex.match(relative_path):
+                # Construct full SAS URL for the blob
+                blob_url = f"{base_url}/{blob_name}?{sas_token}"
+                matching_blobs.append(blob_url)
+
+        print(f"Found {len(matching_blobs)} matching blobs in Azure container")
+    except Exception as e:
+        print(f"Error listing Azure blobs: {e}", file=sys.stderr)
+
+    return matching_blobs
+
+
+def download_azure_blob(blob_url: str, local_path: str) -> None:
+    """Download a blob from Azure to a local path."""
+    account_name, container_name, blob_path, sas_token = parse_azure_sas_url(blob_url)
+
+    # Construct the account URL
+    account_url = f"https://{account_name}.blob.core.windows.net"
+
+    # Create the blob client
+    blob_client = BlobClient(
+        account_url=account_url,
+        container_name=container_name,
+        blob_name=blob_path,
+        credential=sas_token,
+    )
+
+    # Download the blob
+    with open(local_path, "wb") as file:
+        blob_data = blob_client.download_blob()
+        file.write(blob_data.readall())
+
+
+def upload_to_azure(local_path: str, destination_sas_url: str, filename: str) -> str:
+    """
+    Upload a file to Azure Blob Storage using SAS URL.
+    Returns the full URL of the uploaded blob.
+    """
+    account_name, container_name, prefix_path, sas_token = parse_azure_sas_url(
+        destination_sas_url
+    )
+
+    # Construct the blob name with prefix if any
+    blob_name = f"{prefix_path}/{filename}" if prefix_path else filename
+    blob_name = blob_name.lstrip("/")  # Ensure no leading slash
+
+    # Construct the account URL
+    account_url = f"https://{account_name}.blob.core.windows.net"
+
+    # Create the blob client
+    blob_client = BlobClient(
+        account_url=account_url,
+        container_name=container_name,
+        blob_name=blob_name,
+        credential=sas_token,
+    )
+
+    # Upload the file
+    with open(local_path, "rb") as file:
+        blob_client.upload_blob(file, overwrite=True)
+
+    # Return the full URL of the uploaded blob
+    return f"https://{account_name}.blob.core.windows.net/{container_name}/{blob_name}?{sas_token}"
+
+
+def get_filename_from_url(url: str) -> str:
+    """Extract the filename from a URL."""
+    path = urllib.parse.urlparse(url).path
+    return os.path.basename(path)
+
+
+def get_filenames_from_azure(pattern: str) -> Dict[str, str]:
+    """
+    Get filenames from Azure blobs that match the pattern.
+    Returns a dict of {filename_stem: full_blob_url}
+    """
+    # Check if the pattern is an Azure SAS URL with a pattern
+    if is_azure_sas_url(pattern):
+        # For Azure, we need to extract any glob pattern that might be in the URL
+        # Simplify by just listing all blobs and filtering client-side
+        base_url = pattern.split("*")[0] if "*" in pattern else pattern
+
+        # If URL ends with a path separator, remove it
+        base_url = base_url.rstrip("/")
+
+        # Extract the pattern from the original string
+        pattern_part = pattern.split("/")[-1] if "/" in pattern else ""
+        if not ("*" in pattern_part or "{" in pattern_part):
+            # Default to common slide formats if no specific pattern is given
+            pattern_part = "*.{svs,tif,tiff}"
+
+        azure_blobs = list_azure_blobs(base_url, pattern_part)
+        file_dict = {}
+
+        for blob_url in azure_blobs:
+            filename = get_filename_from_url(blob_url)
+            filename_stem = os.path.splitext(filename)[0]
+            file_dict[filename_stem] = blob_url
+
+        return file_dict
+
+    return {}  # Return empty dict if not an Azure URL
 
 
 # --- Pydantic Models ---
@@ -107,27 +309,43 @@ class DeidentifyResponse(BaseModel):
 class BulkDeidentifyResponse(BaseModel):
     """Response model for bulk deidentification operation."""
 
-    results: List[DeidentifyResponse] = Field(..., description="Results for each processed slide.")
-    skipped: List[str] = Field(..., description="Slides that were skipped due to errors or missing boxes.")
-    
-    
+    results: List[DeidentifyResponse] = Field(
+        ..., description="Results for each processed slide."
+    )
+    skipped: List[str] = Field(
+        ..., description="Slides that were skipped due to errors or missing boxes."
+    )
+
+
 class LabelStatsResponse(BaseModel):
     """Response model for label statistics."""
-    
+
     total: int = Field(..., description="Total number of slides")
     labeled: int = Field(..., description="Number of slides that have been labeled")
     unlabeled: int = Field(..., description="Number of slides that are not labeled yet")
-    no_box_needed: int = Field(..., description="Number of slides marked as not needing a box")
+    no_box_needed: int = Field(
+        ..., description="Number of slides marked as not needing a box"
+    )
 
 
 # --- Helper Functions ---
 
 
 def _find_slides(pattern: str) -> None:
-    """Finds slides based on glob pattern and populates global state."""
+    """Finds slides based on glob pattern or Azure SAS URL and populates global state."""
     global slide_paths, filename_to_path
     print(f"Searching for slides using pattern: {pattern}")
 
+    # Check if pattern is an Azure SAS URL
+    if is_azure_sas_url(pattern):
+        print("Detected Azure SAS URL. Searching for slides in Azure.")
+        azure_files = get_filenames_from_azure(pattern)
+        filename_to_path = azure_files
+        slide_paths = [Path(get_filename_from_url(url)) for url in azure_files.values()]
+        print(f"Found {len(slide_paths)} unique slide files in Azure.")
+        return
+
+    # Original local filesystem search
     all_paths_set = set()
     expanded_patterns = []
     # Basic brace expansion handling (like {svs,tif,tiff})
@@ -155,13 +373,7 @@ def _find_slides(pattern: str) -> None:
 
     slide_paths = sorted([p.resolve() for p in all_paths_set if p.is_file()])
     filename_to_path = {p.stem: p for p in slide_paths}
-    print(f"Found {len(slide_paths)} unique slide files.")
-    # print("Full paths found:")
-    # for p in slide_paths:
-    #     print(f"  - {p}")
-    # print("Filename stem mapping:")
-    # for stem, path in filename_to_path.items():
-    #     print(f"  - {stem}: {path}")
+    print(f"Found {len(slide_paths)} unique slide files on local filesystem.")
 
 
 def _load_boxes():
@@ -254,7 +466,17 @@ async def lifespan(app: FastAPI):
     global PERSIST_JSON_PATH, DEIDENTIFIED_DIR
     persist_path_str = os.environ.get("PERSIST_JSON_PATH")
     if persist_path_str:
-        PERSIST_JSON_PATH = Path(persist_path_str).resolve()
+        # Check if this is an Azure SAS URL
+        if is_azure_sas_url(persist_path_str):
+            # For the proof of concept, we're not implementing Azure storage for the JSON
+            # In a real implementation, you would download/upload the JSON as needed
+            print(
+                "Warning: Azure SAS URL for PERSIST_JSON_PATH not fully supported yet."
+            )
+            print("Will use local persistence.")
+            PERSIST_JSON_PATH = Path("boxes.json").resolve()
+        else:
+            PERSIST_JSON_PATH = Path(persist_path_str).resolve()
         print(
             f"Persistence enabled. Boxes will be loaded/saved at: {PERSIST_JSON_PATH}"
         )
@@ -263,12 +485,34 @@ async def lifespan(app: FastAPI):
             "Warning: PERSIST_JSON_PATH environment variable not set. Box data will not be persisted.",
             file=sys.stderr,
         )
-    
+
     deidentified_dir_str = os.environ.get("DEIDENTIFIED_DIR")
     if deidentified_dir_str:
-        DEIDENTIFIED_DIR = Path(deidentified_dir_str).resolve()
-        os.makedirs(DEIDENTIFIED_DIR, exist_ok=True)
-        print(f"Deidentified slides will be saved to: {DEIDENTIFIED_DIR}")
+        if is_azure_sas_url(deidentified_dir_str):
+            # For Azure, we'll keep the SAS URL as a string
+            DEIDENTIFIED_DIR = deidentified_dir_str
+            print(f"Deidentified slides will be uploaded to Azure: {DEIDENTIFIED_DIR}")
+
+            # Verify connection by attempting to list blobs
+            try:
+                container_client = get_container_client_from_sas(DEIDENTIFIED_DIR)
+                _ = list(
+                    container_client.list_blobs(max_results=1)
+                )  # Just check if we can list
+                print("Successfully connected to Azure output container.")
+            except Exception as e:
+                print(
+                    f"Warning: Could not connect to Azure output container: {e}",
+                    file=sys.stderr,
+                )
+                print("Deidentification operations may fail.", file=sys.stderr)
+        else:
+            # Local path
+            DEIDENTIFIED_DIR = Path(deidentified_dir_str).resolve()
+            os.makedirs(DEIDENTIFIED_DIR, exist_ok=True)
+            print(
+                f"Deidentified slides will be saved to local directory: {DEIDENTIFIED_DIR}"
+            )
     else:
         print(
             "Warning: DEIDENTIFIED_DIR environment variable not set. Deidentification endpoint will not be available.",
@@ -431,7 +675,7 @@ async def get_label_stats():
     total = len(filename_to_path)
     labeled = 0
     no_box_needed = 0
-    
+
     for filename in filename_to_path.keys():
         if filename in boxes_store:
             coords = boxes_store[filename]
@@ -439,15 +683,12 @@ async def get_label_stats():
                 no_box_needed += 1
             elif isinstance(coords, list) and len(coords) == 4:
                 labeled += 1
-    
+
     # Unlabeled is the remainder
     unlabeled = total - labeled - no_box_needed
-    
+
     return LabelStatsResponse(
-        total=total,
-        labeled=labeled,
-        unlabeled=unlabeled,
-        no_box_needed=no_box_needed
+        total=total, labeled=labeled, unlabeled=unlabeled, no_box_needed=no_box_needed
     )
 
 
@@ -472,8 +713,24 @@ async def get_slide_image(slide_filename: str):
         )
 
     slide_path = filename_to_path[slide_filename]
+    local_path = None
+    temp_file = None
+
     try:
-        slide = openslide.OpenSlide(str(slide_path))
+        # Handle Azure SAS URL
+        if isinstance(slide_path, str) and is_azure_sas_url(slide_path):
+            # Create a temporary file to download the slide
+            temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".svs")
+            local_path = temp_file.name
+            temp_file.close()  # Close so we can write to it
+
+            # Download the slide from Azure
+            print(f"Downloading slide {slide_filename} from Azure")
+            download_azure_blob(slide_path, local_path)
+            slide = openslide.OpenSlide(local_path)
+        else:
+            # Local file
+            slide = openslide.OpenSlide(str(slide_path))
 
         img: Image.Image | None = None
         # Prioritize associated images often used for labels/thumbnails
@@ -521,6 +778,15 @@ async def get_slide_image(slide_filename: str):
     finally:
         if "slide" in locals() and slide:
             slide.close()
+        # Clean up temporary file if we created one
+        if temp_file and local_path and os.path.exists(local_path):
+            try:
+                os.unlink(local_path)
+            except Exception as e:
+                print(
+                    f"Warning: Could not delete temporary file {local_path}: {e}",
+                    file=sys.stderr,
+                )
 
 
 @app.post(
@@ -530,8 +796,12 @@ async def get_slide_image(slide_filename: str):
     description="Deidentifies a slide by applying a bounding box to redact PHI in the macro image.",
     responses={
         status.HTTP_404_NOT_FOUND: {"description": "Slide not found"},
-        status.HTTP_422_UNPROCESSABLE_ENTITY: {"description": "Slide has no bounding box defined"},
-        status.HTTP_500_INTERNAL_SERVER_ERROR: {"description": "Error processing slide"},
+        status.HTTP_422_UNPROCESSABLE_ENTITY: {
+            "description": "Slide has no bounding box defined"
+        },
+        status.HTTP_500_INTERNAL_SERVER_ERROR: {
+            "description": "Error processing slide"
+        },
     },
 )
 async def deidentify_slide(slide_filename: str):
@@ -541,58 +811,111 @@ async def deidentify_slide(slide_filename: str):
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Slide '{slide_filename}' not found.",
         )
-    
+
     if not DEIDENTIFIED_DIR:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="DEIDENTIFIED_DIR environment variable not set. Deidentification is not available.",
         )
-    
+
     coords = boxes_store.get(slide_filename, [])
-    
+
     # Check if we have coordinates
     if not coords:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail=f"No bounding box defined for slide '{slide_filename}'. Please define a box first.",
         )
-    
-    # Check if this is marked as no-box-needed ([-1,-1,-1,-1])
-    if coords == [-1, -1, -1, -1]:
-        # For slides marked as not needing a box, we'll just copy the slide to the output directory
-        input_path = str(filename_to_path[slide_filename])
-        output_path = str(DEIDENTIFIED_DIR / f"{slide_filename}.svs")
-        
-        try:
-            # Just create a hard link or copy the file
-            if os.path.exists(output_path):
-                os.remove(output_path)
-            try:
-                os.link(input_path, output_path)
-            except (OSError, AttributeError):
-                import shutil
-                shutil.copy2(input_path, output_path)
-                
-            return DeidentifyResponse(slide_filename=slide_filename, output_path=output_path)
-        except Exception as e:
-            raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail=f"Error copying slide '{slide_filename}': {str(e)}",
-            )
-    
-    # Regular case - apply redaction box
-    input_path = str(filename_to_path[slide_filename])
-    output_path = str(DEIDENTIFIED_DIR / f"{slide_filename}.svs")
-    
+
+    slide_path = filename_to_path[slide_filename]
+    local_input_path = None
+    local_output_path = None
+    temp_input_file = None
+    temp_output_file = None
+    output_path = ""
+
     try:
-        replace_macro(input_path, output_path, coords, fill_color=(0, 0, 0))
-        return DeidentifyResponse(slide_filename=slide_filename, output_path=output_path)
+        # Download from Azure if needed
+        if isinstance(slide_path, str) and is_azure_sas_url(slide_path):
+            # Create temporary files for input and output
+            temp_input_file = tempfile.NamedTemporaryFile(delete=False, suffix=".svs")
+            local_input_path = temp_input_file.name
+            temp_input_file.close()
+
+            print(f"Downloading slide {slide_filename} from Azure")
+            download_azure_blob(slide_path, local_input_path)
+        else:
+            # Local file
+            local_input_path = str(slide_path)
+
+        # Create temporary output file if outputting to Azure
+        if isinstance(DEIDENTIFIED_DIR, str) and is_azure_sas_url(DEIDENTIFIED_DIR):
+            temp_output_file = tempfile.NamedTemporaryFile(delete=False, suffix=".svs")
+            local_output_path = temp_output_file.name
+            temp_output_file.close()
+        else:
+            # Local directory
+            local_output_path = str(Path(DEIDENTIFIED_DIR) / f"{slide_filename}.svs")
+
+        # Check if this is marked as no-box-needed ([-1,-1,-1,-1])
+        if coords == [-1, -1, -1, -1]:
+            # For slides marked as not needing a box, we'll just copy the slide
+            try:
+                if os.path.exists(local_output_path):
+                    os.remove(local_output_path)
+
+                import shutil
+
+                shutil.copy2(local_input_path, local_output_path)
+            except Exception as e:
+                raise HTTPException(
+                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                    detail=f"Error copying slide '{slide_filename}': {str(e)}",
+                )
+        else:
+            # Regular case - apply redaction box
+            replace_macro(
+                local_input_path, local_output_path, coords, fill_color=(0, 0, 0)
+            )
+
+        # Upload to Azure if needed
+        if isinstance(DEIDENTIFIED_DIR, str) and is_azure_sas_url(DEIDENTIFIED_DIR):
+            print(f"Uploading deidentified slide {slide_filename} to Azure")
+            output_path = upload_to_azure(
+                local_output_path, DEIDENTIFIED_DIR, f"{slide_filename}.svs"
+            )
+        else:
+            output_path = local_output_path
+
+        return DeidentifyResponse(
+            slide_filename=slide_filename, output_path=output_path
+        )
+
     except Exception as e:
         print(f"Error deidentifying slide '{slide_filename}': {e}", file=sys.stderr)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Error deidentifying slide '{slide_filename}': {str(e)}",
         )
+    finally:
+        # Clean up temporary files
+        if temp_input_file and local_input_path and os.path.exists(local_input_path):
+            try:
+                os.unlink(local_input_path)
+            except Exception as e:
+                print(
+                    f"Warning: Could not delete temporary input file: {e}",
+                    file=sys.stderr,
+                )
+
+        if temp_output_file and local_output_path and os.path.exists(local_output_path):
+            try:
+                os.unlink(local_output_path)
+            except Exception as e:
+                print(
+                    f"Warning: Could not delete temporary output file: {e}",
+                    file=sys.stderr,
+                )
 
 
 @app.post(
@@ -601,7 +924,9 @@ async def deidentify_slide(slide_filename: str):
     summary="Bulk Deidentify Slides",
     description="Deidentifies all slides that have bounding boxes defined.",
     responses={
-        status.HTTP_500_INTERNAL_SERVER_ERROR: {"description": "Error processing slides"},
+        status.HTTP_500_INTERNAL_SERVER_ERROR: {
+            "description": "Error processing slides"
+        },
     },
 )
 async def deidentify_all_slides():
@@ -611,42 +936,116 @@ async def deidentify_all_slides():
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="DEIDENTIFIED_DIR environment variable not set. Deidentification is not available.",
         )
-    
+
     results = []
     skipped = []
-    
+
     # Process all slides with defined bounding boxes
     for slide_filename in filename_to_path.keys():
         coords = boxes_store.get(slide_filename, [])
-        
+
         # Skip slides without coordinates
         if not coords:
             skipped.append(slide_filename)
             continue
-        
-        input_path = str(filename_to_path[slide_filename])
-        output_path = str(DEIDENTIFIED_DIR / f"{slide_filename}.svs")
-        
+
+        slide_path = filename_to_path[slide_filename]
+        local_input_path = None
+        local_output_path = None
+        temp_input_file = None
+        temp_output_file = None
+        output_path = ""
+
         try:
+            # Download from Azure if needed
+            if isinstance(slide_path, str) and is_azure_sas_url(slide_path):
+                # Create temporary files for input and output
+                temp_input_file = tempfile.NamedTemporaryFile(
+                    delete=False, suffix=".svs"
+                )
+                local_input_path = temp_input_file.name
+                temp_input_file.close()
+
+                print(f"Downloading slide {slide_filename} from Azure")
+                download_azure_blob(slide_path, local_input_path)
+            else:
+                # Local file
+                local_input_path = str(slide_path)
+
+            # Create temporary output file if outputting to Azure
+            if isinstance(DEIDENTIFIED_DIR, str) and is_azure_sas_url(DEIDENTIFIED_DIR):
+                temp_output_file = tempfile.NamedTemporaryFile(
+                    delete=False, suffix=".svs"
+                )
+                local_output_path = temp_output_file.name
+                temp_output_file.close()
+            else:
+                # Local directory
+                local_output_path = str(
+                    Path(DEIDENTIFIED_DIR) / f"{slide_filename}.svs"
+                )
+
             # Check if this is marked as no-box-needed ([-1,-1,-1,-1])
             if coords == [-1, -1, -1, -1]:
                 # For slides marked as not needing a box, just copy the slide
-                if os.path.exists(output_path):
-                    os.remove(output_path)
-                try:
-                    os.link(input_path, output_path)
-                except (OSError, AttributeError):
-                    import shutil
-                    shutil.copy2(input_path, output_path)
+                if os.path.exists(local_output_path):
+                    os.remove(local_output_path)
+
+                import shutil
+
+                shutil.copy2(local_input_path, local_output_path)
             else:
                 # Regular case - apply redaction
-                replace_macro(input_path, output_path, coords, fill_color=(0, 0, 0))
-                
-            results.append(DeidentifyResponse(slide_filename=slide_filename, output_path=output_path))
+                replace_macro(
+                    local_input_path, local_output_path, coords, fill_color=(0, 0, 0)
+                )
+
+            # Upload to Azure if needed
+            if isinstance(DEIDENTIFIED_DIR, str) and is_azure_sas_url(DEIDENTIFIED_DIR):
+                print(f"Uploading deidentified slide {slide_filename} to Azure")
+                output_path = upload_to_azure(
+                    local_output_path, DEIDENTIFIED_DIR, f"{slide_filename}.svs"
+                )
+            else:
+                output_path = local_output_path
+
+            results.append(
+                DeidentifyResponse(
+                    slide_filename=slide_filename, output_path=output_path
+                )
+            )
+
         except Exception as e:
             print(f"Error deidentifying slide '{slide_filename}': {e}", file=sys.stderr)
             skipped.append(slide_filename)
-    
+        finally:
+            # Clean up temporary files
+            if (
+                temp_input_file
+                and local_input_path
+                and os.path.exists(local_input_path)
+            ):
+                try:
+                    os.unlink(local_input_path)
+                except Exception as e:
+                    print(
+                        f"Warning: Could not delete temporary input file: {e}",
+                        file=sys.stderr,
+                    )
+
+            if (
+                temp_output_file
+                and local_output_path
+                and os.path.exists(local_output_path)
+            ):
+                try:
+                    os.unlink(local_output_path)
+                except Exception as e:
+                    print(
+                        f"Warning: Could not delete temporary output file: {e}",
+                        file=sys.stderr,
+                    )
+
     return BulkDeidentifyResponse(results=results, skipped=skipped)
 
 
@@ -658,7 +1057,9 @@ if __name__ == "__main__":
 
     print("Starting server with uvicorn. Use Ctrl+C to stop.")
     print("Ensure required environment variables are set, e.g.:")
-    print('SLIDE_PATTERN="sample/identified/*.svs" PERSIST_JSON_PATH="boxes.json" DEIDENTIFIED_DIR="deidentified" python server.py')
+    print(
+        'SLIDE_PATTERN="sample/identified/*.svs" PERSIST_JSON_PATH="boxes.json" DEIDENTIFIED_DIR="deidentified" python server.py'
+    )
     # Read pattern here ONLY if running directly, otherwise rely on lifespan
     if not os.environ.get("SLIDE_PATTERN"):
         print(
