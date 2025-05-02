@@ -19,12 +19,56 @@ Example macro image with red rectangle drawn over PHI:
 
 # Quick Start with Docker
 
+The easiest way to use this tool is with Docker, which bundles both the Python backend and Next.js frontend.
+
 ```bash
-# First, run the script to process the SVS files
-./run_wsi_identifier.sh --project MY_GCP_PROJECT --input-path './sample/macro_images/*.jpg' --output-path './sample/output/' --build
+# Build the Docker image
+./start.sh build
+
+# Run with simple directory arguments
+./start.sh run --dir=./sample/identified --out=./deidentified
+
+# Or run in detached mode
+./start.sh run --dir=./sample/identified --out=./deidentified -d
 ```
 
-# Installation
+This will start:
+
+- FastAPI server on port 8000 (http://localhost:8000)
+- Next.js frontend on port 3000 (http://localhost:3000)
+
+## Docker Options
+
+The `start.sh` script provides simple directory options and more advanced configuration:
+
+```bash
+# Show all available options
+./start.sh help
+
+# Basic usage with input and output directories
+./start.sh run --dir=./sample/identified --out=./deidentified
+
+# Run with custom ports
+./start.sh run --fastapi-port=9000 --nextjs-port=4000
+
+# Add Google Cloud credentials for OCR
+./start.sh run --dir=./path/to/slides --credentials=/path/to/gcp-credentials.json
+
+# Advanced usage for custom mounting
+./start.sh run -v /path/to/slides:/app/sample/identified -v /path/to/output:/app/deidentified
+```
+
+## Example Docker Command for Production
+
+```bash
+./start.sh build && \
+./start.sh run -d \
+  --dir=./sample/identified \
+  --out=./deidentified \
+  --credentials=/path/to/gcp-credentials.json
+```
+
+# Installation (Without Docker)
 
 ```bash
 uv sync
@@ -86,6 +130,19 @@ uv run deidentify.py "path/to/slides/*.svs" \
     --salt "your-secret-salt-here" \
     -o output_dir \
     --rect 100 150 500 600
+```
+
+# Web Client (Without Docker)
+
+```bash
+export SLIDE_PATTERN="sample/identified/*.{svs,tif,tiff}"
+export PERSIST_JSON_PATH="boxes.json"
+export DEIDENTIFIED_DIR="deidentified"
+uv run uvicorn server:app --reload --host 0.0.0.0 --port 8000
+
+# In a separate terminal, start the Next.js frontend
+cd nextjs
+bun run dev
 ```
 
 # Options for identify_boxes.py

@@ -1,0 +1,1 @@
+After making changes to server.py, make sure to go to nextjs dir and run `bun run generate-api-client` to update the TypeScript API client.
