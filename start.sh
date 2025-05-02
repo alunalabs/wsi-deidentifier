@@ -16,25 +16,25 @@ function print_help {
   echo "  help                      Show this help message"
   echo ""
   echo "Options for 'run':"
+  echo "  --dir=PATH                Directory with slides to process (host path)"
+  echo "  --out=PATH                Output directory for deidentified slides (host path)"
   echo "  --fastapi-port=PORT       Port for FastAPI server (default: 8000)"
   echo "  --nextjs-port=PORT        Port for Next.js server (default: 3000)" 
   echo "  --slide-pattern=PATTERN   Glob pattern for slides (default: sample/identified/*.{svs,tif,tiff})"
   echo "  --json-path=PATH          Path to store JSON (default: boxes.json)"
-  echo "  --deidentified-dir=DIR    Directory for deidentified images (default: deidentified)"
   echo "  --credentials=PATH        Path to Google Cloud credentials file"
   echo "  -v, --volume=SRC:DEST     Add a volume mapping (can be used multiple times)"
   echo "  -d, --detach              Run container in detached mode"
   echo ""
   echo "Examples:"
-  echo "  ./start.sh build          Build the Docker image"
-  echo "  ./start.sh run            Run with default settings"
-  echo "  ./start.sh run --fastapi-port=9000 --nextjs-port=4000"
-  echo "  ./start.sh run --credentials=/path/to/credentials.json"
-  echo "  ./start.sh run -v /path/to/slides:/app/sample/identified"
-  echo "  ./start.sh run -d         Run in detached mode"
+  echo "  ./start.sh build                                  Build the Docker image"
+  echo "  ./start.sh run                                    Run with default settings"
+  echo "  ./start.sh run --dir=./sample/identified --out=./deidentified  Simple directory mounting"
+  echo "  ./start.sh run --fastapi-port=9000 --nextjs-port=4000          Custom ports"
+  echo "  ./start.sh run -d                                 Run in detached mode"
   echo ""
   echo "Quick Start Example:"
-  echo "  ./start.sh build && ./start.sh run -v $(pwd)/sample/identified:/app/sample/identified -v $(pwd)/deidentified:/app/deidentified"
+  echo "  ./start.sh build && ./start.sh run --dir=./sample/identified --out=./deidentified"
 }
 
 function build_image {
@@ -55,10 +55,22 @@ function run_container {
   local add_sample_volume=true
   local add_deidentified_volume=true
   local detach_mode=false
+  local input_dir=""
+  local output_dir=""
 
   # Parse arguments
   while [[ $# -gt 0 ]]; do
     case "$1" in
+      --dir=*)
+        input_dir="${1#*=}"
+        add_sample_volume=false
+        shift
+        ;;
+      --out=*)
+        output_dir="${1#*=}"
+        add_deidentified_volume=false
+        shift
+        ;;
       --fastapi-port=*)
         fastapi_port="${1#*=}"
         shift
@@ -123,6 +135,24 @@ function run_container {
         ;;
     esac
   done
+
+  # Process simplified directory options
+  if [[ -n "$input_dir" ]]; then
+    # Make sure the input directory exists
+    if [[ ! -d "$input_dir" ]]; then
+      echo "Error: Input directory '$input_dir' does not exist."
+      exit 1
+    fi
+    volumes+=("$(realpath "$input_dir"):/app/sample/identified")
+    add_sample_volume=false
+  fi
+  
+  if [[ -n "$output_dir" ]]; then
+    # Create the output directory if it doesn't exist
+    mkdir -p "$output_dir"
+    volumes+=("$(realpath "$output_dir"):/app/deidentified")
+    add_deidentified_volume=false
+  fi
 
   # Build docker run command
   cmd=("docker" "run")

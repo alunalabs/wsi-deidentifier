@@ -16,6 +16,7 @@ import useImage from "use-image";
 import {
   getBoundingBoxBoxesSlideFilenameGetOptions,
   getBoundingBoxBoxesSlideFilenameGetQueryKey,
+  getLabelStatsLabelStatsGetOptions,
   getSlideImageSlidesSlideFilenameImageGetOptions,
   setBoundingBoxBoxesSlideFilenamePutMutation,
 } from "../lib/api-client/@tanstack/react-query.gen";
@@ -89,11 +90,16 @@ export const SlideAnnotator: React.FC<SlideAnnotatorProps> = ({
       setInitialBoxCoords(variables.body.coords);
       // Explicitly reset dirty state since we've successfully saved
       setIsDirty(false);
+      // Refetch the box data for this specific slide
       queryClient.refetchQueries({
         queryKey: getBoundingBoxBoxesSlideFilenameGetQueryKey({
           path: { slide_filename: slideStem },
         }),
         exact: true, // Refetch this specific query only
+      });
+      // Invalidate label stats to update the header count
+      queryClient.invalidateQueries({
+        queryKey: getLabelStatsLabelStatsGetOptions().queryKey,
       });
       setTransformerEnabled(true); // Keep selected after save
     },
