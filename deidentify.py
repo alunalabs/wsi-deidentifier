@@ -30,6 +30,12 @@ uv run python deidentify.py "path/to/slides/*.svs" \\
     -o output_dir \\
     --rect 100 150 500 600
 
+# Strip all associated images (label and macro) completely
+uv run python deidentify.py "sample/identified/*.{svs,tif,tiff}" \
+    --salt "your-secret-salt-here" \
+    -o sample/deidentified \
+    --strip-all-images
+
 The script will:
 1. Copy input slides to a specified output directory
 2. Rename them using a salted hash derived from the original filename
@@ -207,6 +213,7 @@ def process_slide(
     writer,
     macro_description: str,
     rect_coords: tuple[int, int, int, int] | None,
+    strip_all_images: bool,
 ) -> None:
     if src.suffix.lower() not in [".svs", ".tif", ".tiff"]:
         return
@@ -217,63 +224,116 @@ def process_slide(
 
     dst.parent.mkdir(parents=True, exist_ok=True)
 
-    macro_exists_in_source = False
-    if rect_coords is not None:
-        macro_exists_in_source = check_macro_exists(src, macro_description)
-        if macro_exists_in_source:
-            print(
-                f"  Found macro ('{macro_description}') in source file {src}. Will attempt replacement after copy."
-            )
-        else:
-            print(
-                f"  Macro ('{macro_description}') not found or check failed in source file {src}. Skipping replacement."
-            )
-
     shutil.copyfile(src, dst)
 
-    delete_associated_image(dst, "label")
-    # strip_metadata(dst)
-
-    if rect_coords is not None and not _rect_is_valid(rect_coords):
-        rect_coords = None  # bad data
-
-    if rect_coords is not None and macro_exists_in_source:
-        print(f"  Attempting macro replacement ({macro_description}) in {dst}")
-        tmp_out = dst.with_suffix(dst.suffix + ".tmp")
+    if strip_all_images:
+        print(f"  Stripping all associated images from {dst}")
         try:
-            replace_macro(
-                str(dst),
-                str(tmp_out),
-                macro_description=macro_description,
-                rect_coords=rect_coords,
-                fill_color=(0, 0, 0),
-            )
-            # Atomic replace original file
-            tmp_out.replace(dst)
-            print(f"  Successfully replaced macro in {dst}.")
+            delete_associated_image(dst, "label")
+            print("    Removed label image.")
+        except Exception as e:
+            print(f"    Warning: Could not remove label image: {e}", file=sys.stderr)
+        try:
+            delete_associated_image(dst, "macro")
+            print("    Removed macro image.")
+        except Exception as e:
+            print(f"    Warning: Could not remove macro image: {e}", file=sys.stderr)
+        # Optionally strip metadata as well if desired in this mode
+        # strip_metadata(dst)
+    else:
+        # Original logic for label deletion and macro handling
+        try:
+            delete_associated_image(dst, "label")
+            print(f"  Removed label image from {dst}")
         except Exception as e:
             print(
-                f"  Error during macro replacement in {dst}: {e}",
+                f"  Warning: Could not remove label image from {dst}: {e}",
                 file=sys.stderr,
             )
-        finally:
-            # Ensure the temporary file is removed if it still exists
-            if tmp_out.exists():
-                try:
-                    tmp_out.unlink()
-                    print(f"  Cleaned up temporary file {tmp_out}")
-                except OSError as unlink_err:
-                    print(
-                        f"  Warning: Could not remove temporary file {tmp_out}: {unlink_err}",
-                        file=sys.stderr,
-                    )
-    elif rect_coords is not None and not macro_exists_in_source:
-        pass
-    else:
-        print(
-            "  No rectangle coordinates provided or macro not found in source, keeping macro image unchanged."
-        )
 
+        macro_exists_in_source = False
+        if rect_coords is not None:
+            # Check in the *copied* file now, as the source might not be accessible
+            # or it's safer to check the file we are modifying.
+            # Note: This check might be less reliable after copying or label removal.
+            # Consider simplifying if macro existence check isn't strictly needed before replacement.
+            try:
+                with dst.open("rb") as fp_check:
+                    t_check = tiffparser.TiffFile(fp_check)
+                    for page in t_check.pages:
+                        desc_tag = page.tags.get("ImageDescription")
+                        if desc_tag:
+                            desc = desc_tag.value
+                            if isinstance(desc, bytes):
+                                desc = desc.decode(errors="ignore")
+                            if macro_description.lower() in desc.lower():
+                                macro_exists_in_source = True
+                                break
+            except Exception as e:
+                print(
+                    f"  Warning: Could not check for macro in destination {dst}: {e}",
+                    file=sys.stderr,
+                )
+
+            if macro_exists_in_source:
+                print(
+                    f"  Found macro ('{macro_description}') in destination file {dst}. Will attempt replacement."
+                )
+            else:
+                print(
+                    f"  Macro ('{macro_description}') not found or check failed in destination file {dst}. Skipping replacement."
+                )
+
+        if rect_coords is not None and not _rect_is_valid(rect_coords):
+            print(
+                f"  Warning: Invalid rectangle coordinates provided {rect_coords}, skipping macro replacement.",
+                file=sys.stderr,
+            )
+            rect_coords = None  # bad data, treat as if no rect was given
+
+        if rect_coords is not None and macro_exists_in_source:
+            print(f"  Attempting macro replacement ({macro_description}) in {dst}")
+            tmp_out = dst.with_suffix(dst.suffix + ".tmp")
+            try:
+                replace_macro(
+                    str(dst),
+                    str(tmp_out),
+                    macro_description=macro_description,
+                    rect_coords=rect_coords,
+                    fill_color=(0, 0, 0),
+                )
+                # Atomic replace original file
+                tmp_out.replace(dst)
+                print(f"  Successfully replaced macro in {dst}.")
+            except Exception as e:
+                print(
+                    f"  Error during macro replacement in {dst}: {e}",
+                    file=sys.stderr,
+                )
+            finally:
+                # Ensure the temporary file is removed if it still exists
+                if tmp_out.exists():
+                    try:
+                        tmp_out.unlink()
+                        print(f"  Cleaned up temporary file {tmp_out}")
+                    except OSError as unlink_err:
+                        print(
+                            f"  Warning: Could not remove temporary file {tmp_out}: {unlink_err}",
+                            file=sys.stderr,
+                        )
+        elif rect_coords is not None and not macro_exists_in_source:
+            # Rect provided but macro wasn't found or check failed
+            pass  # Already printed a message
+        else:
+            # No rectangle coords provided or rect was invalid
+            print(
+                "  No rectangle coordinates provided or macro not found, keeping macro image unchanged."
+            )
+
+        # Strip metadata after potential macro replacement
+        # strip_metadata(dst)
+
+    # Write mapping regardless of image stripping mode
     writer.writerow(
         {
             "slide_id": slide_id,
@@ -441,6 +501,11 @@ def main(argv=None):
             "Progress is saved incrementally to the JSON file specified by --boxes-json (or 'identified_boxes.json' by default).",
         ),
     )
+    p.add_argument(
+        "--strip-all-images",
+        action="store_true",
+        help="Completely remove all associated images (label, macro) instead of masking. Overrides --rect, --boxes-json, and --interactive-label.",
+    )
     args = p.parse_args(argv)
 
     out_dir = Path(args.out)
@@ -548,6 +613,7 @@ def main(argv=None):
                     writer,
                     args.macro_description,
                     rect_coords,
+                    args.strip_all_images,
                 )
                 print(f"✓ {path} → {out_dir}")
             except Exception as e:
