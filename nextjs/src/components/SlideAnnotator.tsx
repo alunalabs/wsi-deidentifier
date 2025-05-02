@@ -43,6 +43,7 @@ export const SlideAnnotator: React.FC<SlideAnnotatorProps> = ({
   const [isDrawing, setIsDrawing] = useState(false);
   const [box, setBox] = useState<Konva.RectConfig | null>(null);
   const [transformerEnabled, setTransformerEnabled] = useState(false); // Start with transformer disabled
+  const [isReady, setIsReady] = useState(false); // Track if Konva is ready
   const stageRef = useRef<Konva.Stage>(null);
   const imageLayerRef = useRef<Konva.Layer>(null);
   const boxLayerRef = useRef<Konva.Layer>(null);
@@ -105,13 +106,15 @@ export const SlideAnnotator: React.FC<SlideAnnotatorProps> = ({
         height: originalHeight * calculatedScale,
       });
       setScale(calculatedScale);
+      setIsReady(true); // Mark as ready after dimensions and scale are set
     }
   }, [konvaImage]);
 
   // Load existing box when query resolves and scale is known
   useEffect(() => {
-    // Avoid race condition: only load if component doesn't have a box yet
+    // Only attempt to load box when everything is ready
     if (
+      isReady &&
       boxQuery.data?.coords &&
       boxQuery.data.coords.length === 4 &&
       scale > 0 &&
@@ -138,7 +141,7 @@ export const SlideAnnotator: React.FC<SlideAnnotatorProps> = ({
         console.warn(`Loaded box for ${slideStem} is too small, ignoring.`);
       }
     }
-  }, [boxQuery.data, scale, slideStem, box, isDrawing]); // Add box and isDrawing dependency
+  }, [boxQuery.data, scale, slideStem, box, isDrawing, isReady]); // Added isReady dependency
 
   // Attach transformer when box exists and is selected
   useEffect(() => {
