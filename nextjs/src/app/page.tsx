@@ -1,4 +1,5 @@
-import { SlideAnnotator } from "@/components/SlideAnnotator";
+"use client";
+import { SlideAnnotatorNoSSR } from "@/components/SlideAnnotatorNoSSR";
 import { getSlidesSlidesGetOptions } from "@/lib/api-client/@tanstack/react-query.gen";
 import { useQuery } from "@tanstack/react-query";
 import { Toaster } from "sonner";
@@ -24,7 +25,7 @@ export default function Home() {
       <h1 className="text-2xl font-bold mb-4">WSI Annotator</h1>
       <div className="grid grid-cols-1 gap-4">
         {slidesQuery.data.slides.map((slideStem) => (
-          <SlideAnnotator key={slideStem} slideStem={slideStem} />
+          <SlideAnnotatorNoSSR key={slideStem} slideStem={slideStem} />
         ))}
       </div>
     </div>

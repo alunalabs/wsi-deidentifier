@@ -1,5 +1,6 @@
 "use client";
 
+import { Button } from "@/components/ui/button";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import Konva from "konva";
 import React, { useCallback, useEffect, useRef, useState } from "react";
@@ -10,7 +11,7 @@ import {
   Stage,
   Transformer,
 } from "react-konva";
-import { toast } from "sonner"; // Import toast from sonner
+import { toast } from "sonner";
 import useImage from "use-image";
 import {
   getBoundingBoxBoxesSlideFilenameGetOptions,
@@ -19,7 +20,6 @@ import {
   setBoundingBoxBoxesSlideFilenamePutMutation,
 } from "../lib/api-client/@tanstack/react-query.gen";
 import type { BoundingBoxInput } from "../lib/api-client/types.gen";
-import { Button } from "./ui/button"; // Assuming shadcn/ui Button
 
 interface SlideAnnotatorProps {
   slideStem: string;
@@ -76,7 +76,7 @@ export const SlideAnnotator: React.FC<SlideAnnotatorProps> = ({
   // Mutation for saving/updating bounding box
   const setBoxMutation = useMutation({
     ...setBoundingBoxBoxesSlideFilenamePutMutation(),
-    onSuccess: (data) => {
+    onSuccess: () => {
       toast.success(`Box saved for ${slideStem}.`);
       queryClient.invalidateQueries({
         queryKey: getBoundingBoxBoxesSlideFilenameGetQueryKey({
@@ -324,7 +324,7 @@ export const SlideAnnotator: React.FC<SlideAnnotatorProps> = ({
     // A dedicated delete mutation could be added later.
     // Example: deleteBoxMutation.mutate({ path: { slide_filename: slideStem } });
     toast.info("Local box removed. Click 'Save Box' to persist deletion.");
-  }, [slideStem]);
+  }, []);
 
   // --- Rendering ---
 
