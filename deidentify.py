@@ -211,8 +211,9 @@ def process_slide(
     if src.suffix.lower() not in [".svs", ".tif", ".tiff"]:
         return
     slide_id = src.stem
-    hashed_id = hash_id(slide_id, salt)
-    dst = out_dir / f"{hashed_id}{src.suffix.lower()}"
+    # Use original filename if salt is not provided
+    output_filename_base = hash_id(slide_id, salt) if salt else slide_id
+    dst = out_dir / f"{output_filename_base}{src.suffix.lower()}"
 
     dst.parent.mkdir(parents=True, exist_ok=True)
 
@@ -238,8 +239,8 @@ def process_slide(
 
     if rect_coords is not None and macro_exists_in_source:
         print(f"  Attempting macro replacement ({macro_description}) in {dst}")
+        tmp_out = dst.with_suffix(dst.suffix + ".tmp")
         try:
-            tmp_out = dst.with_suffix(dst.suffix + ".tmp")
             replace_macro(
                 str(dst),
                 str(tmp_out),
@@ -255,6 +256,17 @@ def process_slide(
                 f"  Error during macro replacement in {dst}: {e}",
                 file=sys.stderr,
             )
+        finally:
+            # Ensure the temporary file is removed if it still exists
+            if tmp_out.exists():
+                try:
+                    tmp_out.unlink()
+                    print(f"  Cleaned up temporary file {tmp_out}")
+                except OSError as unlink_err:
+                    print(
+                        f"  Warning: Could not remove temporary file {tmp_out}: {unlink_err}",
+                        file=sys.stderr,
+                    )
     elif rect_coords is not None and not macro_exists_in_source:
         pass
     else:
@@ -265,7 +277,7 @@ def process_slide(
     writer.writerow(
         {
             "slide_id": slide_id,
-            "hashed_id": hashed_id,
+            "hashed_id": output_filename_base,
             "src_path": src.resolve(),
             "dst_path": dst.resolve(),
         }
@@ -397,7 +409,7 @@ def main(argv=None):
         "slides", nargs="+", help="paths or glob patterns to .svs or .tif files"
     )
     p.add_argument("-o", "--out", default="deidentified", help="output directory")
-    p.add_argument("--salt", required=True, help="secret salt")
+    p.add_argument("--salt", help="secret salt")
     p.add_argument("-m", "--map", default="hash_mapping.csv", help="mapping CSV")
     p.add_argument(
         "--macro-description",
