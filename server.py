@@ -7,7 +7,6 @@ import re
 import sys
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Dict, List
 
 import openslide
 from fastapi import FastAPI, HTTPException, status
@@ -20,11 +19,11 @@ from replace_macro import replace_macro
 # --- Globals / State ---
 
 # Will store Path objects for found slides
-slide_paths: List[Path] = []
+slide_paths: list[Path] = []
 # Maps filename stem to Path object
-filename_to_path: Dict[str, Path] = {}
+filename_to_path: dict[str, Path] = {}
 # In-memory storage for bounding boxes (filename_stem -> [x0, y0, x1, y1] or [-1,-1,-1,-1] for no-box-needed)
-boxes_store: Dict[str, List[int]] = {}
+boxes_store: dict[str, list[int]] = {}
 # Path for persisting boxes
 PERSIST_JSON_PATH: Path | None = None
 # Directory for deidentified slides
@@ -37,13 +36,13 @@ DEIDENTIFIED_DIR: Path | None = None
 class SlideListResponse(BaseModel):
     """Response model for listing slide filenames."""
 
-    slides: List[str] = Field(..., description="List of slide filenames (stems) found.")
+    slides: list[str] = Field(..., description="List of slide filenames (stems) found.")
 
 
 class BoundingBoxInput(BaseModel):
     """Input model for storing bounding box coordinates."""
 
-    coords: List[int] = Field(
+    coords: list[int] = Field(
         ...,
         min_length=4,
         max_length=4,
@@ -53,7 +52,7 @@ class BoundingBoxInput(BaseModel):
     # Removing the validation constraint x0<x1, y0<y1 here, will validate in the endpoint after checking special values
     # @field_validator("coords")
     # @classmethod
-    # def validate_coords(cls, v: List[int]) -> List[int]:
+    # def validate_coords(cls, v: list[int]) -> list[int]:
     #     if len(v) != 4:
     #         # This check is technically redundant due to min/max_length, but good practice
     #         raise ValueError("Coordinates list must contain exactly 4 integers.")
@@ -83,7 +82,7 @@ class BoundingBoxResponse(BaseModel):
     """Response model for retrieving bounding box coordinates."""
 
     slide_filename: str = Field(..., description="The filename stem of the slide.")
-    coords: List[int] = Field(
+    coords: list[int] = Field(
         default_factory=list,
         min_length=0,  # Allow empty list for deleted boxes or [-1,-1,-1,-1]
         description="Bounding box coordinates [x0, y0, x1, y1]. Empty list if no box is set. [-1,-1,-1,-1] if marked as 'no box needed'.",
@@ -107,17 +106,23 @@ class DeidentifyResponse(BaseModel):
 class BulkDeidentifyResponse(BaseModel):
     """Response model for bulk deidentification operation."""
 
-    results: List[DeidentifyResponse] = Field(..., description="Results for each processed slide.")
-    skipped: List[str] = Field(..., description="Slides that were skipped due to errors or missing boxes.")
-    
-    
+    results: list[DeidentifyResponse] = Field(
+        ..., description="Results for each processed slide."
+    )
+    skipped: list[str] = Field(
+        ..., description="Slides that were skipped due to errors or missing boxes."
+    )
+
+
 class LabelStatsResponse(BaseModel):
     """Response model for label statistics."""
-    
+
     total: int = Field(..., description="Total number of slides")
     labeled: int = Field(..., description="Number of slides that have been labeled")
     unlabeled: int = Field(..., description="Number of slides that are not labeled yet")
-    no_box_needed: int = Field(..., description="Number of slides marked as not needing a box")
+    no_box_needed: int = Field(
+        ..., description="Number of slides marked as not needing a box"
+    )
 
 
 # --- Helper Functions ---
@@ -263,7 +268,7 @@ async def lifespan(app: FastAPI):
             "Warning: PERSIST_JSON_PATH environment variable not set. Box data will not be persisted.",
             file=sys.stderr,
         )
-    
+
     deidentified_dir_str = os.environ.get("DEIDENTIFIED_DIR")
     if deidentified_dir_str:
         DEIDENTIFIED_DIR = Path(deidentified_dir_str).resolve()
@@ -396,7 +401,7 @@ async def set_bounding_box(slide_filename: str, box_input: BoundingBoxInput):
 
 @app.get(
     "/boxes/status",
-    response_model=Dict[str, str],
+    response_model=dict[str, str],
     summary="Get Status of All Boxes",
     description="Returns the annotation status for all known slides ('labeled', 'unlabeled', 'no_box_needed').",
 )
@@ -431,7 +436,7 @@ async def get_label_stats():
     total = len(filename_to_path)
     labeled = 0
     no_box_needed = 0
-    
+
     for filename in filename_to_path.keys():
         if filename in boxes_store:
             coords = boxes_store[filename]
@@ -439,15 +444,12 @@ async def get_label_stats():
                 no_box_needed += 1
             elif isinstance(coords, list) and len(coords) == 4:
                 labeled += 1
-    
+
     # Unlabeled is the remainder
     unlabeled = total - labeled - no_box_needed
-    
+
     return LabelStatsResponse(
-        total=total,
-        labeled=labeled,
-        unlabeled=unlabeled,
-        no_box_needed=no_box_needed
+        total=total, labeled=labeled, unlabeled=unlabeled, no_box_needed=no_box_needed
     )
 
 
@@ -530,8 +532,12 @@ async def get_slide_image(slide_filename: str):
     description="Deidentifies a slide by applying a bounding box to redact PHI in the macro image.",
     responses={
         status.HTTP_404_NOT_FOUND: {"description": "Slide not found"},
-        status.HTTP_422_UNPROCESSABLE_ENTITY: {"description": "Slide has no bounding box defined"},
-        status.HTTP_500_INTERNAL_SERVER_ERROR: {"description": "Error processing slide"},
+        status.HTTP_422_UNPROCESSABLE_ENTITY: {
+            "description": "Slide has no bounding box defined"
+        },
+        status.HTTP_500_INTERNAL_SERVER_ERROR: {
+            "description": "Error processing slide"
+        },
     },
 )
 async def deidentify_slide(slide_filename: str):
@@ -541,28 +547,28 @@ async def deidentify_slide(slide_filename: str):
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Slide '{slide_filename}' not found.",
         )
-    
+
     if not DEIDENTIFIED_DIR:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="DEIDENTIFIED_DIR environment variable not set. Deidentification is not available.",
         )
-    
+
     coords = boxes_store.get(slide_filename, [])
-    
+
     # Check if we have coordinates
     if not coords:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail=f"No bounding box defined for slide '{slide_filename}'. Please define a box first.",
         )
-    
+
     # Check if this is marked as no-box-needed ([-1,-1,-1,-1])
     if coords == [-1, -1, -1, -1]:
         # For slides marked as not needing a box, we'll just copy the slide to the output directory
         input_path = str(filename_to_path[slide_filename])
         output_path = str(DEIDENTIFIED_DIR / f"{slide_filename}.svs")
-        
+
         try:
             # Just create a hard link or copy the file
             if os.path.exists(output_path):
@@ -571,22 +577,27 @@ async def deidentify_slide(slide_filename: str):
                 os.link(input_path, output_path)
             except (OSError, AttributeError):
                 import shutil
+
                 shutil.copy2(input_path, output_path)
-                
-            return DeidentifyResponse(slide_filename=slide_filename, output_path=output_path)
+
+            return DeidentifyResponse(
+                slide_filename=slide_filename, output_path=output_path
+            )
         except Exception as e:
             raise HTTPException(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
                 detail=f"Error copying slide '{slide_filename}': {str(e)}",
             )
-    
+
     # Regular case - apply redaction box
     input_path = str(filename_to_path[slide_filename])
     output_path = str(DEIDENTIFIED_DIR / f"{slide_filename}.svs")
-    
+
     try:
         replace_macro(input_path, output_path, coords, fill_color=(0, 0, 0))
-        return DeidentifyResponse(slide_filename=slide_filename, output_path=output_path)
+        return DeidentifyResponse(
+            slide_filename=slide_filename, output_path=output_path
+        )
     except Exception as e:
         print(f"Error deidentifying slide '{slide_filename}': {e}", file=sys.stderr)
         raise HTTPException(
@@ -601,7 +612,9 @@ async def deidentify_slide(slide_filename: str):
     summary="Bulk Deidentify Slides",
     description="Deidentifies all slides that have bounding boxes defined.",
     responses={
-        status.HTTP_500_INTERNAL_SERVER_ERROR: {"description": "Error processing slides"},
+        status.HTTP_500_INTERNAL_SERVER_ERROR: {
+            "description": "Error processing slides"
+        },
     },
 )
 async def deidentify_all_slides():
@@ -611,22 +624,22 @@ async def deidentify_all_slides():
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="DEIDENTIFIED_DIR environment variable not set. Deidentification is not available.",
         )
-    
+
     results = []
     skipped = []
-    
+
     # Process all slides with defined bounding boxes
     for slide_filename in filename_to_path.keys():
         coords = boxes_store.get(slide_filename, [])
-        
+
         # Skip slides without coordinates
         if not coords:
             skipped.append(slide_filename)
             continue
-        
+
         input_path = str(filename_to_path[slide_filename])
         output_path = str(DEIDENTIFIED_DIR / f"{slide_filename}.svs")
-        
+
         try:
             # Check if this is marked as no-box-needed ([-1,-1,-1,-1])
             if coords == [-1, -1, -1, -1]:
@@ -637,16 +650,21 @@ async def deidentify_all_slides():
                     os.link(input_path, output_path)
                 except (OSError, AttributeError):
                     import shutil
+
                     shutil.copy2(input_path, output_path)
             else:
                 # Regular case - apply redaction
                 replace_macro(input_path, output_path, coords, fill_color=(0, 0, 0))
-                
-            results.append(DeidentifyResponse(slide_filename=slide_filename, output_path=output_path))
+
+            results.append(
+                DeidentifyResponse(
+                    slide_filename=slide_filename, output_path=output_path
+                )
+            )
         except Exception as e:
             print(f"Error deidentifying slide '{slide_filename}': {e}", file=sys.stderr)
             skipped.append(slide_filename)
-    
+
     return BulkDeidentifyResponse(results=results, skipped=skipped)
 
 
@@ -658,7 +676,9 @@ if __name__ == "__main__":
 
     print("Starting server with uvicorn. Use Ctrl+C to stop.")
     print("Ensure required environment variables are set, e.g.:")
-    print('SLIDE_PATTERN="sample/identified/*.svs" PERSIST_JSON_PATH="boxes.json" DEIDENTIFIED_DIR="deidentified" python server.py')
+    print(
+        'SLIDE_PATTERN="sample/identified/*.svs" PERSIST_JSON_PATH="boxes.json" DEIDENTIFIED_DIR="deidentified" python server.py'
+    )
     # Read pattern here ONLY if running directly, otherwise rely on lifespan
     if not os.environ.get("SLIDE_PATTERN"):
         print(
