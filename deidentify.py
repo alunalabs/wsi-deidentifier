@@ -245,6 +245,7 @@ def process_slide(
                 str(tmp_out),
                 macro_description=macro_description,
                 rect_coords=rect_coords,
+                fill_color=(0, 0, 0),
             )
             # Atomic replace original file
             tmp_out.replace(dst)
