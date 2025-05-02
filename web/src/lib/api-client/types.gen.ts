@@ -24,13 +24,27 @@ export type BoundingBoxResponse = {
      */
     slide_filename: string;
     /**
-     * Bounding box coordinates [x0, y0, x1, y1].
+     * Bounding box coordinates [x0, y0, x1, y1]. Empty list if no box is set.
      */
-    coords: Array<number>;
+    coords?: Array<number>;
 };
 
 export type HttpValidationError = {
     detail?: Array<ValidationError>;
+};
+
+/**
+ * Response model for returning slide image data.
+ */
+export type SlideImageResponse = {
+    /**
+     * The filename stem of the slide.
+     */
+    slide_filename: string;
+    /**
+     * Base64 encoded PNG image data.
+     */
+    image_data: string;
 };
 
 /**
@@ -76,7 +90,7 @@ export type GetBoundingBoxBoxesSlideFilenameGetData = {
 
 export type GetBoundingBoxBoxesSlideFilenameGetErrors = {
     /**
-     * Bounding box not found for this slide
+     * Slide filename not found
      */
     404: unknown;
     /**
@@ -124,6 +138,41 @@ export type SetBoundingBoxBoxesSlideFilenamePutResponses = {
 };
 
 export type SetBoundingBoxBoxesSlideFilenamePutResponse = SetBoundingBoxBoxesSlideFilenamePutResponses[keyof SetBoundingBoxBoxesSlideFilenamePutResponses];
+
+export type GetSlideImageSlidesSlideFilenameImageGetData = {
+    body?: never;
+    path: {
+        slide_filename: string;
+    };
+    query?: never;
+    url: '/slides/{slide_filename}/image';
+};
+
+export type GetSlideImageSlidesSlideFilenameImageGetErrors = {
+    /**
+     * Slide not found
+     */
+    404: unknown;
+    /**
+     * Validation Error
+     */
+    422: HttpValidationError;
+    /**
+     * Error processing slide image
+     */
+    500: unknown;
+};
+
+export type GetSlideImageSlidesSlideFilenameImageGetError = GetSlideImageSlidesSlideFilenameImageGetErrors[keyof GetSlideImageSlidesSlideFilenameImageGetErrors];
+
+export type GetSlideImageSlidesSlideFilenameImageGetResponses = {
+    /**
+     * Successful Response
+     */
+    200: SlideImageResponse;
+};
+
+export type GetSlideImageSlidesSlideFilenameImageGetResponse = GetSlideImageSlidesSlideFilenameImageGetResponses[keyof GetSlideImageSlidesSlideFilenameImageGetResponses];
 
 export type ClientOptions = {
     baseUrl: 'http://localhost:8000' | (string & {});

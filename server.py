@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+import base64
+import io
 import os
 import re
 import sys
@@ -6,8 +8,10 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Dict, List
 
+import openslide
 from fastapi import FastAPI, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
+from PIL import Image
 from pydantic import BaseModel, Field, field_validator
 
 # --- Globals / State ---
@@ -65,8 +69,16 @@ class BoundingBoxResponse(BaseModel):
 
     slide_filename: str = Field(..., description="The filename stem of the slide.")
     coords: List[int] = Field(
-        ..., description="Bounding box coordinates [x0, y0, x1, y1]."
+        default_factory=list,
+        description="Bounding box coordinates [x0, y0, x1, y1]. Empty list if no box is set.",
     )
+
+
+class SlideImageResponse(BaseModel):
+    """Response model for returning slide image data."""
+
+    slide_filename: str = Field(..., description="The filename stem of the slide.")
+    image_data: str = Field(..., description="Base64 encoded PNG image data.")
 
 
 # --- Helper Functions ---
@@ -174,28 +186,20 @@ async def get_slides():
     "/boxes/{slide_filename}",
     response_model=BoundingBoxResponse,
     summary="Get Bounding Box",
-    description="Retrieves the stored bounding box coordinates for a given slide filename (stem).",
+    description="Retrieves the stored bounding box coordinates for a given slide filename (stem). Returns an empty list if no box is set.",
     responses={
-        status.HTTP_404_NOT_FOUND: {
-            "description": "Bounding box not found for this slide"
-        },
+        status.HTTP_404_NOT_FOUND: {"description": "Slide filename not found"},
     },
 )
 async def get_bounding_box(slide_filename: str):
-    """Returns the bounding box for the specified slide filename."""
+    """Returns the bounding box for the specified slide filename. Returns empty coords if box not set."""
     if slide_filename not in filename_to_path:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Slide '{slide_filename}' not found.",
         )
-    if slide_filename not in boxes_store:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Bounding box not set for slide '{slide_filename}'.",
-        )
-    return BoundingBoxResponse(
-        slide_filename=slide_filename, coords=boxes_store[slide_filename]
-    )
+    coords = boxes_store.get(slide_filename, [])
+    return BoundingBoxResponse(slide_filename=slide_filename, coords=coords)
 
 
 @app.put(
@@ -225,6 +229,78 @@ async def set_bounding_box(slide_filename: str, box_input: BoundingBoxInput):
     print(f"Stored bounding box for {slide_filename}: {box_input.coords}")
 
     return BoundingBoxResponse(slide_filename=slide_filename, coords=box_input.coords)
+
+
+@app.get(
+    "/slides/{slide_filename}/image",
+    response_model=SlideImageResponse,
+    summary="Get Slide Image",
+    description="Retrieves a representative image (macro, thumbnail, or generated) for a slide as base64 PNG.",
+    responses={
+        status.HTTP_404_NOT_FOUND: {"description": "Slide not found"},
+        status.HTTP_500_INTERNAL_SERVER_ERROR: {
+            "description": "Error processing slide image"
+        },
+    },
+)
+async def get_slide_image(slide_filename: str):
+    """Returns a base64 encoded PNG image for the specified slide."""
+    if slide_filename not in filename_to_path:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Slide '{slide_filename}' not found.",
+        )
+
+    slide_path = filename_to_path[slide_filename]
+    try:
+        slide = openslide.OpenSlide(str(slide_path))
+
+        img: Image.Image | None = None
+        # Prioritize associated images often used for labels/thumbnails
+        if "macro" in slide.associated_images:
+            img = slide.associated_images["macro"].convert("RGB")
+            print(f"Using 'macro' image for {slide_filename}")
+        elif "thumbnail" in slide.associated_images:
+            img = slide.associated_images["thumbnail"].convert("RGB")
+            print(f"Using 'thumbnail' image for {slide_filename}")
+        else:
+            # Generate a thumbnail if no suitable associated image is found
+            # Adjust size as needed for frontend display
+            thumbnail_size = (1024, 1024)  # Example size, adjust as necessary
+            img = slide.get_thumbnail(thumbnail_size).convert("RGB")
+            print(f"Generated thumbnail ({thumbnail_size}) for {slide_filename}")
+
+        if img is None:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=f"Could not extract or generate an image for slide '{slide_filename}'.",
+            )
+
+        # Convert PIL image to base64 PNG
+        buffered = io.BytesIO()
+        img.save(buffered, format="PNG")
+        img_str = base64.b64encode(buffered.getvalue()).decode("utf-8")
+
+        return SlideImageResponse(slide_filename=slide_filename, image_data=img_str)
+
+    except openslide.OpenSlideError as e:
+        print(f"OpenSlideError for {slide_filename}: {e}", file=sys.stderr)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Error opening or processing slide '{slide_filename}': {e}",
+        )
+    except Exception as e:
+        print(
+            f"Unexpected error processing image for {slide_filename}: {e}",
+            file=sys.stderr,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Unexpected error processing image for slide '{slide_filename}'.",
+        )
+    finally:
+        if "slide" in locals() and slide:
+            slide.close()
 
 
 # --- Main execution (for running with `python server.py`) ---
