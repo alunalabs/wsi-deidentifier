@@ -1,0 +1,1 @@
+uvx pyinstaller --onefile --name wsi-deidentifier --hidden-import matplotlib --hidden-import matplotlib.pyplot --collect-data matplotlib deidentify.py

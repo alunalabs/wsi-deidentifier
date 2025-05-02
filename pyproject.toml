@@ -17,6 +17,29 @@ dependencies = [
   "pyzbar>=0.1.9",
   "tifffile>=2025.3.30",
   "tinynumpy>=1.2.1",
+  "matplotlib>=3.10.1",
 ]
 
 [tool.uv]
+
+[project.scripts]
+wsi-deidentifier = "deidentify:main"
+
+[build-system]
+requires = ["setuptools>=61.2", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+py-modules = [
+  "deidentify",
+  "identify_boxes",
+  "replace_macro",
+  "tiffparser",
+  "explore_svs",
+  "gcp_ocr_annotate",
+  "gcp_textract",
+  "gemini_extract",
+  "gemini_extract_debug",
+  "reidentify",
+  "view_macro_image",
+]
