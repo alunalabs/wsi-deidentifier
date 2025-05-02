@@ -15,6 +15,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from PIL import Image
 from pydantic import BaseModel, Field
 
+from replace_macro import replace_macro
+
 # --- Globals / State ---
 
 # Will store Path objects for found slides
@@ -25,6 +27,8 @@ filename_to_path: Dict[str, Path] = {}
 boxes_store: Dict[str, List[int]] = {}
 # Path for persisting boxes
 PERSIST_JSON_PATH: Path | None = None
+# Directory for deidentified slides
+DEIDENTIFIED_DIR: Path | None = None
 
 
 # --- Pydantic Models ---
@@ -91,6 +95,29 @@ class SlideImageResponse(BaseModel):
 
     slide_filename: str = Field(..., description="The filename stem of the slide.")
     image_data: str = Field(..., description="Base64 encoded PNG image data.")
+
+
+class DeidentifyResponse(BaseModel):
+    """Response model for deidentification operation."""
+
+    slide_filename: str = Field(..., description="The filename stem of the slide.")
+    output_path: str = Field(..., description="Path to the deidentified slide.")
+
+
+class BulkDeidentifyResponse(BaseModel):
+    """Response model for bulk deidentification operation."""
+
+    results: List[DeidentifyResponse] = Field(..., description="Results for each processed slide.")
+    skipped: List[str] = Field(..., description="Slides that were skipped due to errors or missing boxes.")
+    
+    
+class LabelStatsResponse(BaseModel):
+    """Response model for label statistics."""
+    
+    total: int = Field(..., description="Total number of slides")
+    labeled: int = Field(..., description="Number of slides that have been labeled")
+    unlabeled: int = Field(..., description="Number of slides that are not labeled yet")
+    no_box_needed: int = Field(..., description="Number of slides marked as not needing a box")
 
 
 # --- Helper Functions ---
@@ -224,7 +251,7 @@ async def lifespan(app: FastAPI):
         print("Shutting down server.")
         return
 
-    global PERSIST_JSON_PATH
+    global PERSIST_JSON_PATH, DEIDENTIFIED_DIR
     persist_path_str = os.environ.get("PERSIST_JSON_PATH")
     if persist_path_str:
         PERSIST_JSON_PATH = Path(persist_path_str).resolve()
@@ -234,6 +261,17 @@ async def lifespan(app: FastAPI):
     else:
         print(
             "Warning: PERSIST_JSON_PATH environment variable not set. Box data will not be persisted.",
+            file=sys.stderr,
+        )
+    
+    deidentified_dir_str = os.environ.get("DEIDENTIFIED_DIR")
+    if deidentified_dir_str:
+        DEIDENTIFIED_DIR = Path(deidentified_dir_str).resolve()
+        os.makedirs(DEIDENTIFIED_DIR, exist_ok=True)
+        print(f"Deidentified slides will be saved to: {DEIDENTIFIED_DIR}")
+    else:
+        print(
+            "Warning: DEIDENTIFIED_DIR environment variable not set. Deidentification endpoint will not be available.",
             file=sys.stderr,
         )
 
@@ -383,6 +421,37 @@ async def get_boxes_status():
 
 
 @app.get(
+    "/label-stats",
+    response_model=LabelStatsResponse,
+    summary="Get Label Statistics",
+    description="Returns statistics about labeled, unlabeled, and no-box-needed slides.",
+)
+async def get_label_stats():
+    """Calculates and returns statistics about slide annotation status."""
+    total = len(filename_to_path)
+    labeled = 0
+    no_box_needed = 0
+    
+    for filename in filename_to_path.keys():
+        if filename in boxes_store:
+            coords = boxes_store[filename]
+            if coords == [-1, -1, -1, -1]:
+                no_box_needed += 1
+            elif isinstance(coords, list) and len(coords) == 4:
+                labeled += 1
+    
+    # Unlabeled is the remainder
+    unlabeled = total - labeled - no_box_needed
+    
+    return LabelStatsResponse(
+        total=total,
+        labeled=labeled,
+        unlabeled=unlabeled,
+        no_box_needed=no_box_needed
+    )
+
+
+@app.get(
     "/slides/{slide_filename}/image",
     response_model=SlideImageResponse,
     summary="Get Slide Image",
@@ -454,6 +523,133 @@ async def get_slide_image(slide_filename: str):
             slide.close()
 
 
+@app.post(
+    "/slides/{slide_filename}/deidentify",
+    response_model=DeidentifyResponse,
+    summary="Deidentify Slide",
+    description="Deidentifies a slide by applying a bounding box to redact PHI in the macro image.",
+    responses={
+        status.HTTP_404_NOT_FOUND: {"description": "Slide not found"},
+        status.HTTP_422_UNPROCESSABLE_ENTITY: {"description": "Slide has no bounding box defined"},
+        status.HTTP_500_INTERNAL_SERVER_ERROR: {"description": "Error processing slide"},
+    },
+)
+async def deidentify_slide(slide_filename: str):
+    """Deidentifies a slide using its stored bounding box coordinates."""
+    if slide_filename not in filename_to_path:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Slide '{slide_filename}' not found.",
+        )
+    
+    if not DEIDENTIFIED_DIR:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="DEIDENTIFIED_DIR environment variable not set. Deidentification is not available.",
+        )
+    
+    coords = boxes_store.get(slide_filename, [])
+    
+    # Check if we have coordinates
+    if not coords:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"No bounding box defined for slide '{slide_filename}'. Please define a box first.",
+        )
+    
+    # Check if this is marked as no-box-needed ([-1,-1,-1,-1])
+    if coords == [-1, -1, -1, -1]:
+        # For slides marked as not needing a box, we'll just copy the slide to the output directory
+        input_path = str(filename_to_path[slide_filename])
+        output_path = str(DEIDENTIFIED_DIR / f"{slide_filename}.svs")
+        
+        try:
+            # Just create a hard link or copy the file
+            if os.path.exists(output_path):
+                os.remove(output_path)
+            try:
+                os.link(input_path, output_path)
+            except (OSError, AttributeError):
+                import shutil
+                shutil.copy2(input_path, output_path)
+                
+            return DeidentifyResponse(slide_filename=slide_filename, output_path=output_path)
+        except Exception as e:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=f"Error copying slide '{slide_filename}': {str(e)}",
+            )
+    
+    # Regular case - apply redaction box
+    input_path = str(filename_to_path[slide_filename])
+    output_path = str(DEIDENTIFIED_DIR / f"{slide_filename}.svs")
+    
+    try:
+        replace_macro(input_path, output_path, coords, fill_color=(0, 0, 0))
+        return DeidentifyResponse(slide_filename=slide_filename, output_path=output_path)
+    except Exception as e:
+        print(f"Error deidentifying slide '{slide_filename}': {e}", file=sys.stderr)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Error deidentifying slide '{slide_filename}': {str(e)}",
+        )
+
+
+@app.post(
+    "/slides/deidentify-all",
+    response_model=BulkDeidentifyResponse,
+    summary="Bulk Deidentify Slides",
+    description="Deidentifies all slides that have bounding boxes defined.",
+    responses={
+        status.HTTP_500_INTERNAL_SERVER_ERROR: {"description": "Error processing slides"},
+    },
+)
+async def deidentify_all_slides():
+    """Deidentifies all slides that have defined bounding boxes."""
+    if not DEIDENTIFIED_DIR:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="DEIDENTIFIED_DIR environment variable not set. Deidentification is not available.",
+        )
+    
+    results = []
+    skipped = []
+    
+    # Process all slides with defined bounding boxes
+    for slide_filename in filename_to_path.keys():
+        coords = boxes_store.get(slide_filename, [])
+        
+        # Skip slides without coordinates
+        if not coords:
+            skipped.append(slide_filename)
+            continue
+        
+        input_path = str(filename_to_path[slide_filename])
+        output_path = str(DEIDENTIFIED_DIR / f"{slide_filename}.svs")
+        
+        try:
+            # Check if this is marked as no-box-needed ([-1,-1,-1,-1])
+            if coords == [-1, -1, -1, -1]:
+                # For slides marked as not needing a box, just copy the slide
+                if os.path.exists(output_path):
+                    os.remove(output_path)
+                try:
+                    os.link(input_path, output_path)
+                except (OSError, AttributeError):
+                    import shutil
+                    shutil.copy2(input_path, output_path)
+            else:
+                # Regular case - apply redaction
+                replace_macro(input_path, output_path, coords, fill_color=(0, 0, 0))
+                
+            results.append(DeidentifyResponse(slide_filename=slide_filename, output_path=output_path))
+        except Exception as e:
+            print(f"Error deidentifying slide '{slide_filename}': {e}", file=sys.stderr)
+            skipped.append(slide_filename)
+    
+    return BulkDeidentifyResponse(results=results, skipped=skipped)
+
+
 # --- Main execution (for running with `python server.py`) ---
 # Note: It's generally better to run with `uvicorn server:app --reload`
 
@@ -461,8 +657,8 @@ if __name__ == "__main__":
     import uvicorn
 
     print("Starting server with uvicorn. Use Ctrl+C to stop.")
-    print("Ensure SLIDE_PATTERN environment variable is set, e.g.:")
-    print('SLIDE_PATTERN="sample/identified/*.svs" python server.py')
+    print("Ensure required environment variables are set, e.g.:")
+    print('SLIDE_PATTERN="sample/identified/*.svs" PERSIST_JSON_PATH="boxes.json" DEIDENTIFIED_DIR="deidentified" python server.py')
     # Read pattern here ONLY if running directly, otherwise rely on lifespan
     if not os.environ.get("SLIDE_PATTERN"):
         print(
@@ -474,6 +670,11 @@ if __name__ == "__main__":
     if not os.environ.get("PERSIST_JSON_PATH"):
         print(
             "Warning: PERSIST_JSON_PATH not set. Box data will not be persisted if run this way.",
+            file=sys.stderr,
+        )
+    if not os.environ.get("DEIDENTIFIED_DIR"):
+        print(
+            "Warning: DEIDENTIFIED_DIR not set. Deidentification endpoints will not be available if run this way.",
             file=sys.stderr,
         )
 

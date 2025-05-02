@@ -29,8 +29,58 @@ export type BoundingBoxResponse = {
     coords?: Array<number>;
 };
 
+/**
+ * Response model for bulk deidentification operation.
+ */
+export type BulkDeidentifyResponse = {
+    /**
+     * Results for each processed slide.
+     */
+    results: Array<DeidentifyResponse>;
+    /**
+     * Slides that were skipped due to errors or missing boxes.
+     */
+    skipped: Array<string>;
+};
+
+/**
+ * Response model for deidentification operation.
+ */
+export type DeidentifyResponse = {
+    /**
+     * The filename stem of the slide.
+     */
+    slide_filename: string;
+    /**
+     * Path to the deidentified slide.
+     */
+    output_path: string;
+};
+
 export type HttpValidationError = {
     detail?: Array<ValidationError>;
+};
+
+/**
+ * Response model for label statistics.
+ */
+export type LabelStatsResponse = {
+    /**
+     * Total number of slides
+     */
+    total: number;
+    /**
+     * Number of slides that have been labeled
+     */
+    labeled: number;
+    /**
+     * Number of slides that are not labeled yet
+     */
+    unlabeled: number;
+    /**
+     * Number of slides marked as not needing a box
+     */
+    no_box_needed: number;
 };
 
 /**
@@ -157,6 +207,22 @@ export type GetBoxesStatusBoxesStatusGetResponses = {
 
 export type GetBoxesStatusBoxesStatusGetResponse = GetBoxesStatusBoxesStatusGetResponses[keyof GetBoxesStatusBoxesStatusGetResponses];
 
+export type GetLabelStatsLabelStatsGetData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/label-stats';
+};
+
+export type GetLabelStatsLabelStatsGetResponses = {
+    /**
+     * Successful Response
+     */
+    200: LabelStatsResponse;
+};
+
+export type GetLabelStatsLabelStatsGetResponse = GetLabelStatsLabelStatsGetResponses[keyof GetLabelStatsLabelStatsGetResponses];
+
 export type GetSlideImageSlidesSlideFilenameImageGetData = {
     body?: never;
     path: {
@@ -191,6 +257,62 @@ export type GetSlideImageSlidesSlideFilenameImageGetResponses = {
 };
 
 export type GetSlideImageSlidesSlideFilenameImageGetResponse = GetSlideImageSlidesSlideFilenameImageGetResponses[keyof GetSlideImageSlidesSlideFilenameImageGetResponses];
+
+export type DeidentifySlideSlidesSlideFilenameDeidentifyPostData = {
+    body?: never;
+    path: {
+        slide_filename: string;
+    };
+    query?: never;
+    url: '/slides/{slide_filename}/deidentify';
+};
+
+export type DeidentifySlideSlidesSlideFilenameDeidentifyPostErrors = {
+    /**
+     * Slide not found
+     */
+    404: unknown;
+    /**
+     * Slide has no bounding box defined
+     */
+    422: unknown;
+    /**
+     * Error processing slide
+     */
+    500: unknown;
+};
+
+export type DeidentifySlideSlidesSlideFilenameDeidentifyPostResponses = {
+    /**
+     * Successful Response
+     */
+    200: DeidentifyResponse;
+};
+
+export type DeidentifySlideSlidesSlideFilenameDeidentifyPostResponse = DeidentifySlideSlidesSlideFilenameDeidentifyPostResponses[keyof DeidentifySlideSlidesSlideFilenameDeidentifyPostResponses];
+
+export type DeidentifyAllSlidesSlidesDeidentifyAllPostData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/slides/deidentify-all';
+};
+
+export type DeidentifyAllSlidesSlidesDeidentifyAllPostErrors = {
+    /**
+     * Error processing slides
+     */
+    500: unknown;
+};
+
+export type DeidentifyAllSlidesSlidesDeidentifyAllPostResponses = {
+    /**
+     * Successful Response
+     */
+    200: BulkDeidentifyResponse;
+};
+
+export type DeidentifyAllSlidesSlidesDeidentifyAllPostResponse = DeidentifyAllSlidesSlidesDeidentifyAllPostResponses[keyof DeidentifyAllSlidesSlidesDeidentifyAllPostResponses];
 
 export type ClientOptions = {
     baseUrl: 'http://localhost:8000' | (string & {});

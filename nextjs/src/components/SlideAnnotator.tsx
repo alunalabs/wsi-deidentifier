@@ -82,8 +82,13 @@ export const SlideAnnotator: React.FC<SlideAnnotatorProps> = ({
   // Mutation for saving/updating bounding box
   const setBoxMutation = useMutation({
     ...setBoundingBoxBoxesSlideFilenamePutMutation(),
-    onSuccess: () => {
+    onSuccess: (data, variables) => {
       toast.success(`Box saved for ${slideStem}.`);
+      // When a save is successful, update the initialBoxCoords to match the saved state
+      // This ensures we have the correct reference point for future dirty state checks
+      setInitialBoxCoords(variables.body.coords);
+      // Explicitly reset dirty state since we've successfully saved
+      setIsDirty(false);
       queryClient.refetchQueries({
         queryKey: getBoundingBoxBoxesSlideFilenameGetQueryKey({
           path: { slide_filename: slideStem },
@@ -495,10 +500,12 @@ export const SlideAnnotator: React.FC<SlideAnnotatorProps> = ({
 
     // Only call mutation if the state actually changed
     if (dirty) {
+      const newCoords: [number, number, number, number] = [0, 0, 0, 0]; // Special value for deletion -> unlabeled
       setBoxMutation.mutate({
         path: { slide_filename: slideStem },
-        body: { coords: [0, 0, 0, 0] }, // Special value for deletion -> unlabeled
+        body: { coords: newCoords },
       });
+      // We don't need to update isDirty here since the onSuccess handler will do that
       toast.info("Box deleted. Saving...");
     } else {
       toast.info("Already unlabeled.");
@@ -517,10 +524,12 @@ export const SlideAnnotator: React.FC<SlideAnnotatorProps> = ({
 
     // Only call mutation if the state actually changed
     if (dirty) {
+      const newCoords: [number, number, number, number] = [-1, -1, -1, -1]; // Special value for no box needed
       setBoxMutation.mutate({
         path: { slide_filename: slideStem },
-        body: { coords: [-1, -1, -1, -1] }, // Special value for no box needed
+        body: { coords: newCoords },
       });
+      // We don't need to update isDirty here since the onSuccess handler will do that
       toast.info("Marked as 'No Box Needed'. Saving...");
     } else {
       toast.info("Already marked as 'No Box Needed'.");
