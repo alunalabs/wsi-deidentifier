@@ -99,6 +99,15 @@ uv run python identify_boxes.py "./sample/macro_images/*.{jpg,png}" --output ./s
 uv run python identify_boxes.py "./sample/macro_images/*.{jpg,png}" --boxes-json-path ./sample/identified_boxes.json
 
 # You can inspect the JSON file to verify the identified boxes are correct
+
+uv run python deidentify.py "sample/identified/CMU-1.svs" \
+    -o deidentified \
+    --interactive-label \
+    --fill-color white \
+    --font-color black \
+    --macro-font-size 20 \
+    --macro-text "SAMPLE_CASE_ID"
+
 ```
 
 ## 2. De-identify Slides
