@@ -1,4 +1,4 @@
-# PHI De-identifier
+# WSI De-identifier
 
 This tool processes Whole Slide Image (WSI) files (`.svs`, `.tif`, `.tiff`) to remove potentially identifying information. It performs the following steps:
 
