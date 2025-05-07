@@ -57,6 +57,7 @@ from pathlib import Path
 
 import matplotlib.pyplot as plt
 from matplotlib.widgets import RectangleSelector
+from PIL import ImageColor
 
 import tiffparser
 from replace_macro import load_macro_openslide, replace_macro
@@ -177,6 +178,30 @@ def strip_metadata(path: Path) -> None:
 ###############################################################################
 # Helper Functions (including new one)
 ###############################################################################
+def parse_color(color_string: str) -> tuple[int, int, int]:
+    """Parses a color string (name or hex) into an RGB tuple."""
+    if color_string.startswith("#"):
+        return ImageColor.getrgb(color_string)
+    # For common color names, ImageColor.getrgb can also handle them
+    try:
+        return ImageColor.getrgb(color_string)
+    except ValueError:
+        # Fallback for a few basic names if ImageColor doesn't get them directly without #
+        # This is more of a safeguard; ImageColor is usually robust.
+        color_map = {
+            "black": (0, 0, 0),
+            "white": (255, 255, 255),
+            "red": (255, 0, 0),
+            "green": (0, 255, 0),
+            "blue": (0, 0, 255),
+        }
+        if color_string.lower() in color_map:
+            return color_map[color_string.lower()]
+        raise ValueError(
+            f"Invalid color string: {color_string}. Use common names or hex codes (e.g., '#FF0000')."
+        )
+
+
 def check_macro_exists(src_file_path: Path, macro_description: str) -> bool:
     """Checks if a macro image with the given description exists in the original TIFF file."""
     try:
@@ -214,6 +239,10 @@ def process_slide(
     macro_description: str,
     rect_coords: tuple[int, int, int, int] | None,
     strip_all_images: bool,
+    macro_text: str | None,
+    macro_font_size: int | None,
+    fill_color_rgb: tuple[int, int, int],
+    font_color_rgb: tuple[int, int, int],
 ) -> None:
     if src.suffix.lower() not in [".svs", ".tif", ".tiff"]:
         return
@@ -300,7 +329,10 @@ def process_slide(
                     str(tmp_out),
                     macro_description=macro_description,
                     rect_coords=rect_coords,
-                    fill_color=(0, 0, 0),
+                    fill_color=fill_color_rgb,
+                    text=macro_text,
+                    font_size=macro_font_size if macro_font_size is not None else 14,
+                    font_color=font_color_rgb,
                 )
                 # Atomic replace original file
                 tmp_out.replace(dst)
@@ -506,6 +538,29 @@ def main(argv=None):
         action="store_true",
         help="Completely remove all associated images (label, macro) instead of masking. Overrides --rect, --boxes-json, and --interactive-label.",
     )
+    p.add_argument(
+        "--macro-text",
+        help="Text to add at center of macro image (optional).",
+        default=None,
+    )
+    p.add_argument(
+        "--macro-font-size",
+        type=int,
+        help="Font size for the text on the macro image (optional, default: 14).",
+        default=14,
+    )
+    p.add_argument(
+        "--fill-color",
+        type=str,
+        default="black",
+        help="Fill color for the redaction rectangle on the macro image (e.g., 'black', '#000000'). Default: black.",
+    )
+    p.add_argument(
+        "--font-color",
+        type=str,
+        default="white",
+        help="Font color for the text on the macro image (e.g., 'white', '#FFFFFF'). Default: white.",
+    )
     args = p.parse_args(argv)
 
     out_dir = Path(args.out)
@@ -593,6 +648,17 @@ def main(argv=None):
             print("No files found matching the provided patterns.")
             return
 
+        try:
+            parsed_fill_color = parse_color(args.fill_color)
+        except ValueError as e:
+            print(f"Error parsing --fill-color: {e}", file=sys.stderr)
+            return
+        try:
+            parsed_font_color = parse_color(args.font_color)
+        except ValueError as e:
+            print(f"Error parsing --font-color: {e}", file=sys.stderr)
+            return
+
         for path in sorted(list(all_paths)):
             print(f"Processing path: {path}")
             path_str = str(path.resolve())
@@ -614,6 +680,10 @@ def main(argv=None):
                     args.macro_description,
                     rect_coords,
                     args.strip_all_images,
+                    args.macro_text,
+                    args.macro_font_size,
+                    parsed_fill_color,
+                    parsed_font_color,
                 )
                 print(f"✓ {path} → {out_dir}")
             except Exception as e:

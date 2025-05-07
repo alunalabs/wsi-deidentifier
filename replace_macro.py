@@ -21,7 +21,7 @@ import sys
 from io import BytesIO
 
 import openslide
-from PIL import Image, ImageDraw, ImageFile
+from PIL import Image, ImageColor, ImageDraw, ImageFile, ImageFont
 
 # allow Pillow to open incomplete JPEGs
 ImageFile.LOAD_TRUNCATED_IMAGES = True
@@ -435,6 +435,9 @@ def replace_macro(
     verbose=False,
     macro_description="macro",
     fill_color=(255, 0, 0),
+    text=None,
+    font_size=14,  # Default font size
+    font_color=(255, 255, 255),  # Default font color (white)
 ):
     """High-level helper – redact the macro by drawing a rectangle.
 
@@ -473,6 +476,63 @@ def replace_macro(
 
     ImageDraw.Draw(img).rectangle([x0, y0, x1 - 1, y1 - 1], fill=fill_color)
     logging.debug("Rectangle drawn at %s", (x0, y0, x1, y1))
+    if text:
+        draw = ImageDraw.Draw(img)
+        try:
+            # Attempt to load a more common font, fall back to default
+            font = ImageFont.truetype("arial.ttf", font_size)
+        except IOError:
+            font = ImageFont.load_default(font_size)
+
+        # Calculate the center of the rectangle
+        rect_center_x = (x0 + x1) / 2
+        rect_center_y = (y0 + y1) / 2
+
+        # Word wrapping logic within the rectangle's width
+        # Use a slightly smaller width for text to avoid touching edges
+        max_width = (x1 - x0) * 0.9
+
+        words = text.split()
+        lines = []
+        curr_line = ""
+        for word in words:
+            test_line = curr_line + (" " if curr_line else "") + word
+            # Use textbbox for more accurate width calculation
+            if font.getbbox(test_line)[2] - font.getbbox(test_line)[0] <= max_width:
+                curr_line = test_line
+            else:
+                if curr_line:
+                    lines.append(curr_line)
+                curr_line = word
+        if curr_line:
+            lines.append(curr_line)
+
+        if lines:
+            line_heights = [
+                font.getbbox(line)[3] - font.getbbox(line)[1] for line in lines
+            ]
+            total_text_block_height = sum(line_heights) + (
+                font.getmetrics()[1] * (len(lines) - 1) if len(lines) > 1 else 0
+            )  # descent for interline spacing
+
+            # Start y position for the first line, centered in the rectangle
+            y_text = rect_center_y - (total_text_block_height / 2)
+
+            for i, line_content in enumerate(lines):
+                line_width = (
+                    font.getbbox(line_content)[2] - font.getbbox(line_content)[0]
+                )
+                # Calculate x position to center the text line within the rectangle
+                x_text = rect_center_x - (line_width / 2)
+
+                # Draw the text line.
+                draw.text((x_text, y_text), line_content, fill=font_color, font=font)
+                y_text += line_heights[i] + (
+                    font.getmetrics()[1] if i < len(lines) - 1 else 0
+                )  # add descent for spacing
+            logging.debug("Text '%s' drawn at center of rectangle", text)
+        else:
+            logging.debug("No text lines to draw for the provided text: '%s'", text)
 
     _write_slide_with_new_macro(
         info=info,
@@ -540,6 +600,23 @@ if __name__ == "__main__":
         default="macro",
         help="String identifier for the macro image in ImageDescription tag (default: 'macro'). Case-insensitive.",
     )
+    parser.add_argument(
+        "--text",
+        help="Text label to add at center of macro image (optional).",
+        default=None,
+    )
+    parser.add_argument(
+        "--font-size",
+        type=int,
+        default=14,
+        help="Font size for the text label (default: 14).",
+    )
+    parser.add_argument(
+        "--font-color",
+        type=str,
+        default="white",
+        help="Font color for the text label (e.g., 'white', '#FFFFFF'). Default: white.",
+    )
 
     parsed_args = parser.parse_args()
 
@@ -548,6 +625,38 @@ if __name__ == "__main__":
     rect_coords = tuple(parsed_args.rect) if parsed_args.rect else None
     verbosity = parsed_args.verbose
     macro_desc = parsed_args.macro_description
+    text = parsed_args.text
+    font_size = parsed_args.font_size
+    try:
+        # Attempt to parse if it's a string (e.g., hex or name)
+        from PIL import ImageColor
+
+        parsed_font_color = ImageColor.getrgb(parsed_args.font_color)
+    except (ValueError, ImportError):
+        # Fallback or assume it might be passed as a tuple in some contexts (though CLI gives string)
+        # For direct CLI use, a simple default or error if parsing fails.
+        # Defaulting to white if parsing fails and it's for direct script execution.
+        # This part might need refinement if replace_macro.py is often run standalone with this new arg.
+        if isinstance(parsed_args.font_color, str):
+            logging.warning(
+                f"Could not parse font color '{parsed_args.font_color}', defaulting to white. "
+                "Please use hex codes (e.g. '#FFFFFF') or standard color names if running replace_macro.py directly."
+            )
+            parsed_font_color = (
+                255,
+                255,
+                255,
+            )  # Default to white on parsing error for standalone
+        elif (
+            isinstance(parsed_args.font_color, tuple)
+            and len(parsed_args.font_color) == 3
+        ):
+            parsed_font_color = parsed_args.font_color
+        else:
+            logging.warning(
+                f"Invalid font color format '{parsed_args.font_color}', defaulting to white."
+            )
+            parsed_font_color = (255, 255, 255)
 
     if out_path is None:
         input_dir = os.path.dirname(inp_path)
@@ -566,4 +675,7 @@ if __name__ == "__main__":
         verbosity,
         macro_desc,
         fill_color=(0, 0, 0),
+        text=text,
+        font_size=font_size,
+        font_color=parsed_font_color,
     )
