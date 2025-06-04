@@ -178,3 +178,6 @@ identified_boxes.json
 hash_mapping.csv
 deidentified/
 interactive_boxes.json
+
+.DS_Store
+.env

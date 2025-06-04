@@ -4,45 +4,48 @@ De-identifies Whole Slide Image (WSI) files by removing PHI from metadata and ma
 
 This script processes WSI files (.svs, .tif, .tiff) to remove potentially identifying information.
 It can work with pre-identified bounding boxes from identify_boxes.py or use default/specified
-rectangles for masking.
+rectangles for masking. Optionally, filenames can be hashed using a salt for additional anonymization.
 
 Usage Examples
 -------------
-# Process slides using pre-identified bounding boxes
+# Process slides using pre-identified bounding boxes with salt (hashed filenames)
 uv run python deidentify.py "sample/identified/*.svs" --salt "your-secret-salt" --boxes-json identified_boxes.json
 
-# Basic de-identification without modifying macro images
+# Basic de-identification with salt (hashed filenames)
 uv run python deidentify.py "sample/identified/*.{svs,tif,tiff}" \\
     --salt "your-secret-salt-here" \\
     -o sample/deidentified \\
     -m sample/hash_mapping.csv
 
-# Default centered rectangle for macro masking
+# Process slides without salt (preserves original filenames)
+uv run python deidentify.py "sample/identified/*.{svs,tif,tiff}" \\
+    -o sample/deidentified \\
+    -m sample/hash_mapping.csv
+
+# Default centered rectangle for macro masking with salt
 uv run python deidentify.py "sample/identified/*.{svs,tif,tiff}" \\
     --salt "your-secret-salt-here" \\
     -o sample/deidentified \\
     --macro-description "macro" \\
     --rect 0 0 0 0
 
-# Specify custom rectangle coordinates (x0 y0 x1 y1)
+# Specify custom rectangle coordinates without salt (preserves filenames)
 uv run python deidentify.py "path/to/slides/*.svs" \\
-    --salt "your-secret-salt-here" \\
     -o output_dir \\
     --rect 100 150 500 600
 
-# Strip all associated images (label and macro) completely
+# Strip all associated images (label and macro) completely without salt
 uv run python deidentify.py "sample/identified/*.{svs,tif,tiff}" \
-    --salt "your-secret-salt-here" \
     -o sample/deidentified \
     --strip-all-images
 
 The script will:
 1. Copy input slides to a specified output directory
-2. Rename them using a salted hash derived from the original filename
+2. Optionally rename them using a salted hash derived from the original filename (if --salt is provided)
 3. Remove the "label" image (which often contains PHI)
 4. Strip non-technical metadata fields 
 5. Optionally redact the "macro" image by masking areas containing PHI (only if --rect or --boxes-json is specified)
-6. Generate a CSV mapping of original to hashed filenames
+6. Generate a CSV mapping of original to processed filenames (hashed if salt provided, original if not)
 """
 
 import argparse
@@ -227,14 +230,16 @@ def check_macro_exists(src_file_path: Path, macro_description: str) -> bool:
 ###############################################################################
 # CLI
 ###############################################################################
-def hash_id(slide_id: str, salt: str) -> str:
+def hash_id(slide_id: str, salt: str | None) -> str:
+    if salt is None:
+        return slide_id
     return hashlib.sha256((salt + slide_id).encode()).hexdigest()
 
 
 def process_slide(
     src: Path,
     out_dir: Path,
-    salt: str,
+    salt: str | None,
     writer,
     macro_description: str,
     rect_coords: tuple[int, int, int, int] | None,
@@ -248,7 +253,7 @@ def process_slide(
         return
     slide_id = src.stem
     # Use original filename if salt is not provided
-    output_filename_base = hash_id(slide_id, salt) if salt else slide_id
+    output_filename_base = hash_id(slide_id, salt)
     dst = out_dir / f"{output_filename_base}{src.suffix.lower()}"
 
     dst.parent.mkdir(parents=True, exist_ok=True)
@@ -495,13 +500,16 @@ def _rect_is_valid(rect: tuple[int, int, int, int] | list[int]) -> bool:
 
 def main(argv=None):
     p = argparse.ArgumentParser(
-        description="Copy .svs or .tif slides, strip label/macro images, scrub metadata, and rename using salted hash"
+        description="Copy .svs or .tif slides, strip label/macro images, scrub metadata, and optionally rename using salted hash"
     )
     p.add_argument(
         "slides", nargs="+", help="paths or glob patterns to .svs or .tif files"
     )
     p.add_argument("-o", "--out", default="deidentified", help="output directory")
-    p.add_argument("--salt", help="secret salt")
+    p.add_argument(
+        "--salt",
+        help="secret salt for filename hashing (optional). If not provided, original filenames are preserved.",
+    )
     p.add_argument("-m", "--map", default="hash_mapping.csv", help="mapping CSV")
     p.add_argument(
         "--macro-description",

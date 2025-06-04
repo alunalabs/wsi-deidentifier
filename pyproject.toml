@@ -16,6 +16,7 @@ dependencies = [
   "pillow>=11.2.1",
   "pylibdmtx>=0.1.10",
   "pytesseract>=0.3.13",
+  "python-dotenv>=1.1.0",
   "pyzbar>=0.1.9",
   "setuptools>=80.1.0",
   "tifffile>=2025.3.30",
