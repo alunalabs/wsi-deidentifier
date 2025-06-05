@@ -642,6 +642,11 @@ def main(argv=None):
                     # For relative patterns, use current working directory
                     pattern_paths = list(Path().glob(exp_pattern))
 
+                # Filter out macOS resource fork files (._filename)
+                pattern_paths = [
+                    p for p in pattern_paths if not p.name.startswith("._")
+                ]
+
                 if pattern_paths:
                     print(
                         f"  Found {len(pattern_paths)} files for pattern '{exp_pattern}'"
