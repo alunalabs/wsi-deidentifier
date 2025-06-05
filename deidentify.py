@@ -624,7 +624,24 @@ def main(argv=None):
                 expanded_patterns = [pattern]
 
             for exp_pattern in expanded_patterns:
-                pattern_paths = list(Path().glob(exp_pattern))
+                # Handle absolute vs relative patterns
+                if Path(exp_pattern).is_absolute():
+                    # For absolute patterns, use the parent directory and relative pattern
+                    pattern_path = Path(exp_pattern)
+                    if pattern_path.is_dir():
+                        # If it's a directory, glob all supported files in it
+                        pattern_paths = []
+                        for ext in [".svs", ".tif", ".tiff"]:
+                            pattern_paths.extend(pattern_path.glob(f"*{ext}"))
+                    else:
+                        # If it's a file pattern, use the parent and name
+                        parent_dir = pattern_path.parent
+                        pattern_name = pattern_path.name
+                        pattern_paths = list(parent_dir.glob(pattern_name))
+                else:
+                    # For relative patterns, use current working directory
+                    pattern_paths = list(Path().glob(exp_pattern))
+
                 if pattern_paths:
                     print(
                         f"  Found {len(pattern_paths)} files for pattern '{exp_pattern}'"
