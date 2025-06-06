@@ -15,10 +15,10 @@ jobs:
         with:
           python-version: '3.12'
       - name: Install system dependencies
-        run: sudo apt-get update && sudo apt-get install -y libglib2.0-0 libgl1 libopenjp2-7 libtiff5 openslide-tools
+        run: sudo apt-get update && sudo apt-get install -y libglib2.0-0 libgl1 libopenjp2-7 libtiff6 openslide-tools
       - name: Install Python dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install .
+          pip install pytest pillow matplotlib tinynumpy tifffile openslide-python
       - name: Run tests
         run: python -m pytest -q
