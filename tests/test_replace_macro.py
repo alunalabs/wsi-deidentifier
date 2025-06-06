@@ -2,8 +2,12 @@ import glob
 import os
 import sys
 
-import openslide
 import pytest
+
+try:
+    import openslide  # noqa: F401
+except Exception:
+    pytest.skip("openslide not available", allow_module_level=True)
 
 # Add the project root to the Python path to allow importing replace_macro
 project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
