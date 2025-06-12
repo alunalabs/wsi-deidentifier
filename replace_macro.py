@@ -19,6 +19,7 @@ import os
 import struct
 import sys
 from io import BytesIO
+from pathlib import Path
 
 import openslide
 from PIL import Image, ImageColor, ImageDraw, ImageFile, ImageFont
@@ -198,6 +199,63 @@ def load_macro_openslide(path):
             return slide.associated_images.get("macro", None)
     except Exception:  # structural corruption or vendor-specific corner cases
         return None
+
+
+def add_aluna_labs_logo(img, rect_coords, logo_scale=0.08):
+    """Add Aluna Labs logo and text to the bottom right of a rectangle.
+    
+    Args:
+        img: PIL Image to modify
+        rect_coords: tuple (x0, y0, x1, y1) of rectangle coordinates
+        logo_scale: scale factor for logo size relative to rectangle width
+    """
+    x0, y0, x1, y1 = rect_coords
+    rect_width = x1 - x0
+    rect_height = y1 - y0
+    
+    # Load the Aluna Labs logo
+    logo_path = Path(__file__).parent / "aluna_labs_logo.png"
+    if not logo_path.exists():
+        logging.warning(f"Aluna Labs logo not found at {logo_path}")
+        return
+    
+    try:
+        logo = Image.open(logo_path).convert("RGBA")
+        
+        # Calculate logo size - make it very small relative to rectangle
+        logo_width = int(rect_width * logo_scale)
+        logo_height = int(logo.height * logo_width / logo.width)
+        
+        # Ensure minimum readable size but keep it tiny
+        min_size = 20
+        if logo_width < min_size:
+            logo_width = min_size
+            logo_height = int(logo.height * logo_width / logo.width)
+        
+        # Resize logo
+        logo_resized = logo.resize((logo_width, logo_height), Image.LANCZOS)
+        
+        # Position logo in bottom left of rectangle with small margin
+        margin = 5
+        logo_x = x0 + margin
+        logo_y = y1 - logo_height - margin
+        
+        # Ensure logo stays within rectangle bounds
+        logo_x = max(x0 + margin, min(logo_x, x1 - logo_width - margin))
+        logo_y = max(y0 + margin, min(logo_y, y1 - logo_height - margin))
+        
+        # Paste logo onto image
+        if logo_resized.mode == 'RGBA':
+            img.paste(logo_resized, (logo_x, logo_y), logo_resized)
+        else:
+            img.paste(logo_resized, (logo_x, logo_y))
+        
+        # Note: The new logo already contains the "Aluna" text, so no additional text is needed
+        
+        logging.debug(f"Added Aluna Labs logo and text at ({logo_x}, {logo_y})")
+        
+    except Exception as e:
+        logging.warning(f"Failed to add Aluna Labs logo: {e}")
 
 
 def load_macro_fallback(data, offsets, counts, w, h, cmp, endian):
@@ -476,6 +534,9 @@ def replace_macro(
 
     ImageDraw.Draw(img).rectangle([x0, y0, x1 - 1, y1 - 1], fill=fill_color)
     logging.debug("Rectangle drawn at %s", (x0, y0, x1, y1))
+    
+    # Add Aluna Labs logo to the bottom right of the rectangle
+    add_aluna_labs_logo(img, (x0, y0, x1, y1))
     if text:
         draw = ImageDraw.Draw(img)
         try:
