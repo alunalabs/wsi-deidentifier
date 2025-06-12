@@ -250,9 +250,7 @@ def add_aluna_labs_logo(img, rect_coords, logo_scale=0.08):
         else:
             img.paste(logo_resized, (logo_x, logo_y))
         
-        # Note: The new logo already contains the "Aluna" text, so no additional text is needed
-        
-        logging.debug(f"Added Aluna Labs logo and text at ({logo_x}, {logo_y})")
+
         
     except Exception as e:
         logging.warning(f"Failed to add Aluna Labs logo: {e}")
