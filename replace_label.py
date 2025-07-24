@@ -1,16 +1,8 @@
 #!/usr/bin/env python3
 """
-Overwrite the "Macro" associated image in an SVS file
-with one that has a solid red rectangle hiding PHI.
+Replace the "Label" associated image in an SVS file with a solid colored rectangle containing text.
 
-Usage
------
-python replace_macro.py INPUT.SVS [OUTPUT.SVS] [x0 y0 x1 y1] [-v|--verbose]
-
-• OUTPUT.SVS defaults to "INPUT_macro_covered.svs".
-• If no coordinates are given, a rectangle the size of ¼ the macro's
-  width × height is centred in the image.
-• -v / --verbose enables debug-level logging.
+This is based on replace_macro.py but specifically for label images.
 """
 
 import argparse
@@ -192,15 +184,15 @@ def align(n: int, big: bool) -> int:
     return (n + (7 if big else 3)) & (~7 if big else ~3)
 
 
-def load_macro_openslide(path):
+def load_label_openslide(path):
     try:
         with openslide.OpenSlide(path) as slide:
-            return slide.associated_images.get("macro", None)
+            return slide.associated_images.get("label", None)
     except Exception:  # structural corruption or vendor-specific corner cases
         return None
 
 
-def load_macro_fallback(data, offsets, counts, w, h, cmp, endian):
+def load_label_fallback(data, offsets, counts, w, h, cmp, endian):
     if cmp == 1:
         raw = b"".join(data[o : o + c] for o, c in zip(offsets, counts))
         return Image.frombytes("RGB", (w, h), raw)
@@ -233,21 +225,21 @@ def fail(msg, **ctx):
 # Public helpers ------------------------------------------------------------
 
 
-def read_svs_macro_info(input_path, *, macro_description="macro", verbose=False):
-    """Parse *input_path* and locate the macro IFD.
+def read_svs_label_info(input_path, *, label_description="label", verbose=False):
+    """Parse *input_path* and locate the label IFD.
 
     Returns a dictionary with the following keys::
 
         data            – the full file contents (bytearray – mutable)
         endian          – byte-order mark ("<" little, ">" big)
         bigtiff         – bool – *True* if BigTIFF (64-bit offsets)
-        macro_entries   – list[IFDEntry] for the macro image
-        width, height   – macro dimensions (pixels)
+        label_entries   – list[IFDEntry] for the label image
+        width, height   – label dimensions (pixels)
         spp, bps, cmp   – samples/pixel, bits/sample, compression
 
     The function terminates the program via *fail()* if the slide is not a
-    TIFF or no macro image could be found.  It does **not** attempt to decode
-    the actual macro bitmap – that is left to the caller.
+    TIFF or no label image could be found.  It does **not** attempt to decode
+    the actual label bitmap – that is left to the caller.
     """
 
     logging.basicConfig(
@@ -280,27 +272,27 @@ def read_svs_macro_info(input_path, *, macro_description="macro", verbose=False)
     else:
         ifd_off = struct.unpack(endian + "I", data[4:8])[0]
 
-    macro_entries: list[IFDEntry] | None = None
+    label_entries: list[IFDEntry] | None = None
 
     while ifd_off:
         entries, nxt = read_ifd(data, ifd_off, endian, big=bigtiff)
         desc = ascii_val(entries, TAG_IMAGE_DESCRIPTION, data, endian).lower()
-        if macro_description.lower() in desc:
-            macro_entries = entries
+        if label_description.lower() in desc:
+            label_entries = entries
             break
         ifd_off = nxt
 
-    if macro_entries is None:
-        fail("Macro image not found", description=macro_description)
+    if label_entries is None:
+        fail("Label image not found", description=label_description)
 
-    width = int_val(macro_entries, TAG_IMAGE_WIDTH, data, endian)
-    height = int_val(macro_entries, TAG_IMAGE_LENGTH, data, endian)
-    spp = int_val(macro_entries, TAG_SAMPLES_PER_PIXEL, data, endian) or 3
-    bps = int_val(macro_entries, TAG_BITS_PER_SAMPLE, data, endian) or 8
-    cmp = int_val(macro_entries, TAG_COMPRESSION, data, endian) or 1
+    width = int_val(label_entries, TAG_IMAGE_WIDTH, data, endian)
+    height = int_val(label_entries, TAG_IMAGE_LENGTH, data, endian)
+    spp = int_val(label_entries, TAG_SAMPLES_PER_PIXEL, data, endian) or 3
+    bps = int_val(label_entries, TAG_BITS_PER_SAMPLE, data, endian) or 8
+    cmp = int_val(label_entries, TAG_COMPRESSION, data, endian) or 1
 
     logging.debug(
-        "Macro: %dx%d, spp=%d, bps=%d, compression=%d",
+        "Label: %dx%d, spp=%d, bps=%d, compression=%d",
         width,
         height,
         spp,
@@ -309,13 +301,13 @@ def read_svs_macro_info(input_path, *, macro_description="macro", verbose=False)
     )
 
     if spp != 3:
-        fail("Unsupported macro format – need RGB samples_per_pixel=3", spp=spp)
+        fail("Unsupported label format – need RGB samples_per_pixel=3", spp=spp)
 
     return {
         "data": data,
         "endian": endian,
         "bigtiff": bigtiff,
-        "macro_entries": macro_entries,
+        "label_entries": label_entries,
         "width": width,
         "height": height,
         "spp": spp,
@@ -324,7 +316,7 @@ def read_svs_macro_info(input_path, *, macro_description="macro", verbose=False)
     }
 
 
-def _write_slide_with_new_macro(
+def _write_slide_with_new_label(
     *,
     info: dict,
     img: Image.Image,
@@ -332,16 +324,16 @@ def _write_slide_with_new_macro(
     output_path: str,
     verbose: bool = False,
 ):
-    """Patch *input_path* so that the macro image is replaced with *img*.
+    """Patch *input_path* so that the label image is replaced with *img*.
 
-    The heavy lifting for *replace_macro* and *replace_macro_with_image* lives
+    The heavy lifting for *replace_label* and *replace_label_with_image* lives
     here so both variants share the exact same byte-level logic.
     """
 
     data: bytearray = info["data"]
     endian: str = info["endian"]
     bigtiff: bool = info["bigtiff"]
-    macro: list[IFDEntry] = info["macro_entries"]
+    label: list[IFDEntry] = info["label_entries"]
     w: int = info["width"]
     h: int = info["height"]
 
@@ -359,9 +351,9 @@ def _write_slide_with_new_macro(
     new_off = align(original_size, bigtiff)
     bc = len(buf)
 
-    # Helper for quick tag lookup in the macro IFD -----------------------
+    # Helper for quick tag lookup in the label IFD -----------------------
     def entry(tag):
-        return next((e for e in macro if e.tag == tag), None)
+        return next((e for e in label if e.tag == tag), None)
 
     patches: list[tuple[int, bytes]] = []  # (file_position, packed_bytes)
 
@@ -428,55 +420,34 @@ def _write_slide_with_new_macro(
 # Public API ----------------------------------------------------------------
 
 
-def replace_macro(
+def replace_label(
     input_path,
     output_path,
-    rect_coords=None,
     verbose=False,
-    macro_description="macro",
-    fill_color=(255, 0, 0),
+    label_description="label",
+    fill_color=(255, 255, 255),
     text=None,
     font_size=14,  # Default font size
-    font_color=(255, 255, 255),  # Default font color (white)
+    font_color=(0, 0, 0),  # Default font color (black)
     logo_path=None,  # Path to logo image
 ):
-    """High-level helper – redact the macro by drawing a rectangle.
+    """High-level helper – replace the label with a solid colored rectangle containing text.
 
-    This convenience wrapper keeps the original CLI behaviour intact while
-    delegating all heavy lifting to :func:`read_svs_macro_info` and
-    :func:`_write_slide_with_new_macro`.
+    This function creates a new label image that completely covers the original
+    label dimensions with a solid color and optional centered text.
     """
 
     # Gather metadata + verify slide ------------------------------------
-    info = read_svs_macro_info(
-        input_path, macro_description=macro_description, verbose=verbose
+    info = read_svs_label_info(
+        input_path, label_description=label_description, verbose=verbose
     )
 
     w = info["width"]
     h = info["height"]
 
-    # Decode existing macro so we can paint the rectangle ---------------
-    img = load_macro_openslide(input_path)
-    if img is None:
-        fail("Unable to decode macro", compression=info["cmp"])
-    img = img.convert("RGB")
-
-    if rect_coords:
-        x0, y0, x1, y1 = rect_coords
-    else:
-        dw, dh = w // 4, h // 4
-        x0, y0 = (w - dw) // 2, (h - dh) // 2
-        x1, y1 = x0 + dw, y0 + dh
-
-    if not (0 <= x0 < x1 <= w and 0 <= y0 < y1 <= h):
-        fail(
-            "Rectangle outside image bounds",
-            rect=f"{x0},{y0},{x1},{y1}",
-            image=f"{w}x{h}",
-        )
-
-    ImageDraw.Draw(img).rectangle([x0, y0, x1 - 1, y1 - 1], fill=fill_color)
-    logging.debug("Rectangle drawn at %s", (x0, y0, x1, y1))
+    # Create a new image with solid fill color
+    img = Image.new("RGB", (w, h), fill_color)
+    
     if text:
         draw = ImageDraw.Draw(img)
         try:
@@ -485,13 +456,13 @@ def replace_macro(
         except IOError:
             font = ImageFont.load_default(font_size)
 
-        # Calculate the center of the rectangle
-        rect_center_x = (x0 + x1) / 2
-        rect_center_y = (y0 + y1) / 2
+        # Calculate the center of the image
+        center_x = w / 2
+        center_y = h / 2
 
-        # Word wrapping logic within the rectangle's width
+        # Word wrapping logic within the image's width
         # Use a slightly smaller width for text to avoid touching edges
-        max_width = (x1 - x0) * 0.9
+        max_width = w * 0.9
 
         words = text.split()
         lines = []
@@ -516,22 +487,22 @@ def replace_macro(
                 font.getmetrics()[1] * (len(lines) - 1) if len(lines) > 1 else 0
             )  # descent for interline spacing
 
-            # Start y position for the first line, centered in the rectangle
-            y_text = rect_center_y - (total_text_block_height / 2)
+            # Start y position for the first line, centered in the image
+            y_text = center_y - (total_text_block_height / 2)
 
             for i, line_content in enumerate(lines):
                 line_width = (
                     font.getbbox(line_content)[2] - font.getbbox(line_content)[0]
                 )
-                # Calculate x position to center the text line within the rectangle
-                x_text = rect_center_x - (line_width / 2)
+                # Calculate x position to center the text line within the image
+                x_text = center_x - (line_width / 2)
 
                 # Draw the text line.
                 draw.text((x_text, y_text), line_content, fill=font_color, font=font)
                 y_text += line_heights[i] + (
                     font.getmetrics()[1] if i < len(lines) - 1 else 0
                 )  # add descent for spacing
-            logging.debug("Text '%s' drawn at center of rectangle", text)
+            logging.debug("Text '%s' drawn at center of label", text)
         else:
             logging.debug("No text lines to draw for the provided text: '%s'", text)
 
@@ -540,10 +511,9 @@ def replace_macro(
         try:
             logo = Image.open(logo_path)
             # Calculate logo size - make it fit nicely in the bottom left
-            # Logo height will be 1/4 of rectangle height, maintain aspect ratio
-            rect_height = y1 - y0
-            logo_max_height = rect_height // 4
-            logo_max_width = (x1 - x0) // 3  # Max 1/3 of rectangle width
+            # Logo height will be 1/4 of image height, maintain aspect ratio
+            logo_max_height = h // 4
+            logo_max_width = w // 3  # Max 1/3 of image width
             
             # Calculate scaling to fit within constraints
             logo_aspect = logo.width / logo.height
@@ -561,10 +531,10 @@ def replace_macro(
             # Resize logo
             logo = logo.resize((new_width, new_height), Image.LANCZOS)
             
-            # Position at bottom left of rectangle with small margin
+            # Position at bottom left of image with small margin
             margin = 10
-            logo_x = x0 + margin
-            logo_y = y1 - new_height - margin
+            logo_x = margin
+            logo_y = h - new_height - margin
             
             # Paste logo onto image
             if logo.mode == 'RGBA':
@@ -572,11 +542,11 @@ def replace_macro(
             else:
                 img.paste(logo, (logo_x, logo_y))
                 
-            logging.debug("Logo added at bottom left of rectangle")
+            logging.debug("Logo added at bottom left of label")
         except Exception as e:
             logging.warning(f"Could not add logo: {e}")
 
-    _write_slide_with_new_macro(
+    _write_slide_with_new_label(
         info=info,
         img=img,
         input_path=input_path,
@@ -585,25 +555,25 @@ def replace_macro(
     )
 
 
-def replace_macro_with_image(
+def replace_label_with_image(
     *,
     input_path: str,
     output_path: str,
     replacement_img: "Image.Image",
     verbose: bool = False,
-    macro_description: str = "macro",
+    label_description: str = "label",
 ):
-    """Replace the macro thumbnail with *replacement_img*.
+    """Replace the label thumbnail with *replacement_img*.
 
     The *replacement_img* is converted to RGB and resized if necessary to the
-    dimensions of the original macro.
+    dimensions of the original label.
     """
 
-    info = read_svs_macro_info(
-        input_path, macro_description=macro_description, verbose=verbose
+    info = read_svs_label_info(
+        input_path, label_description=label_description, verbose=verbose
     )
 
-    _write_slide_with_new_macro(
+    _write_slide_with_new_label(
         info=info,
         img=replacement_img,
         input_path=input_path,
@@ -614,8 +584,8 @@ def replace_macro_with_image(
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Overwrite the macro image in an SVS file with a redacted version.",
-        usage="%(prog)s INPUT.SVS [OUTPUT.SVS] [x0 y0 x1 y1] [-v|--verbose]",
+        description="Replace the label image in an SVS file with a solid colored rectangle containing text.",
+        usage="%(prog)s INPUT.SVS [OUTPUT.SVS] [-v|--verbose]",
     )
     parser.add_argument(
         "input_svs", metavar="INPUT.SVS", help="Path to the input SVS file."
@@ -625,98 +595,71 @@ if __name__ == "__main__":
         metavar="OUTPUT.SVS",
         nargs="?",
         default=None,
-        help="Path for the output SVS file (optional). Defaults to 'INPUT_macro_covered.svs'.",
-    )
-    parser.add_argument(
-        "rect",
-        metavar="N",
-        type=int,
-        nargs="*",
-        help="Coordinates [x0 y0 x1 y1] for the redaction rectangle (optional). Defaults to a centered rectangle of 1/4 image size.",
+        help="Path for the output SVS file (optional). Defaults to 'INPUT_label_replaced.svs'.",
     )
     parser.add_argument(
         "-v", "--verbose", action="store_true", help="Enable debug-level logging."
     )
     parser.add_argument(
-        "--macro-description",
-        default="macro",
-        help="String identifier for the macro image in ImageDescription tag (default: 'macro'). Case-insensitive.",
+        "--label-description",
+        default="label",
+        help="String identifier for the label image in ImageDescription tag (default: 'label'). Case-insensitive.",
     )
     parser.add_argument(
         "--text",
-        help="Text label to add at center of macro image (optional).",
+        help="Text to add at center of label image (optional).",
         default=None,
     )
     parser.add_argument(
         "--font-size",
         type=int,
         default=14,
-        help="Font size for the text label (default: 14).",
+        help="Font size for the text (default: 14).",
+    )
+    parser.add_argument(
+        "--fill-color",
+        type=str,
+        default="white",
+        help="Fill color for the label background (e.g., 'white', '#FFFFFF'). Default: white.",
     )
     parser.add_argument(
         "--font-color",
         type=str,
-        default="white",
-        help="Font color for the text label (e.g., 'white', '#FFFFFF'). Default: white.",
+        default="black",
+        help="Font color for the text (e.g., 'black', '#000000'). Default: black.",
     )
 
     parsed_args = parser.parse_args()
 
     inp_path = parsed_args.input_svs
     out_path = parsed_args.output_svs
-    rect_coords = tuple(parsed_args.rect) if parsed_args.rect else None
     verbosity = parsed_args.verbose
-    macro_desc = parsed_args.macro_description
+    label_desc = parsed_args.label_description
     text = parsed_args.text
     font_size = parsed_args.font_size
+    
     try:
-        # Attempt to parse if it's a string (e.g., hex or name)
         from PIL import ImageColor
-
+        parsed_fill_color = ImageColor.getrgb(parsed_args.fill_color)
         parsed_font_color = ImageColor.getrgb(parsed_args.font_color)
-    except (ValueError, ImportError):
-        # Fallback or assume it might be passed as a tuple in some contexts (though CLI gives string)
-        # For direct CLI use, a simple default or error if parsing fails.
-        # Defaulting to white if parsing fails and it's for direct script execution.
-        # This part might need refinement if replace_macro.py is often run standalone with this new arg.
-        if isinstance(parsed_args.font_color, str):
-            logging.warning(
-                f"Could not parse font color '{parsed_args.font_color}', defaulting to white. "
-                "Please use hex codes (e.g. '#FFFFFF') or standard color names if running replace_macro.py directly."
-            )
-            parsed_font_color = (
-                255,
-                255,
-                255,
-            )  # Default to white on parsing error for standalone
-        elif (
-            isinstance(parsed_args.font_color, tuple)
-            and len(parsed_args.font_color) == 3
-        ):
-            parsed_font_color = parsed_args.font_color
-        else:
-            logging.warning(
-                f"Invalid font color format '{parsed_args.font_color}', defaulting to white."
-            )
-            parsed_font_color = (255, 255, 255)
+    except ValueError:
+        logging.warning("Could not parse color, using defaults")
+        parsed_fill_color = (255, 255, 255)  # Default to white
+        parsed_font_color = (0, 0, 0)  # Default to black
 
     if out_path is None:
         input_dir = os.path.dirname(inp_path)
         input_basename = os.path.basename(inp_path)
-        output_dir = os.path.join(os.path.dirname(input_dir), "macro_covered")
+        output_dir = os.path.join(os.path.dirname(input_dir), "label_replaced")
         os.makedirs(output_dir, exist_ok=True)  # Ensure the directory exists
         out_path = os.path.join(output_dir, input_basename)
 
-    if rect_coords and len(rect_coords) != 4:
-        parser.error("Rectangle requires 4 integer coordinates: x0 y0 x1 y1.")
-
-    replace_macro(
+    replace_label(
         inp_path,
         out_path,
-        rect_coords,
         verbosity,
-        macro_desc,
-        fill_color=(0, 0, 0),
+        label_desc,
+        fill_color=parsed_fill_color,
         text=text,
         font_size=font_size,
         font_color=parsed_font_color,

@@ -64,6 +64,7 @@ from PIL import ImageColor
 
 import tiffparser
 from replace_macro import load_macro_openslide, replace_macro
+from replace_label import replace_label
 
 
 ###############################################################################
@@ -248,6 +249,11 @@ def process_slide(
     macro_font_size: int | None,
     fill_color_rgb: tuple[int, int, int],
     font_color_rgb: tuple[int, int, int],
+    label_text: str | None,
+    label_font_size: int | None,
+    label_fill_color_rgb: tuple[int, int, int],
+    label_font_color_rgb: tuple[int, int, int],
+    logo_path: str | None,
 ) -> None:
     if src.suffix.lower() not in [".svs", ".tif", ".tiff"]:
         return
@@ -276,14 +282,49 @@ def process_slide(
         # strip_metadata(dst)
     else:
         # Original logic for label deletion and macro handling
-        try:
-            delete_associated_image(dst, "label")
-            print(f"  Removed label image from {dst}")
-        except Exception as e:
-            print(
-                f"  Warning: Could not remove label image from {dst}: {e}",
-                file=sys.stderr,
-            )
+        if label_text is not None:
+            # Replace label with text instead of deleting
+            print(f"  Attempting label replacement in {dst}")
+            tmp_out = dst.with_suffix(dst.suffix + ".tmp")
+            try:
+                replace_label(
+                    str(dst),
+                    str(tmp_out),
+                    fill_color=label_fill_color_rgb,
+                    text=label_text,
+                    font_size=label_font_size if label_font_size is not None else 14,
+                    font_color=label_font_color_rgb,
+                    logo_path=logo_path,
+                )
+                # Atomic replace original file
+                tmp_out.replace(dst)
+                print(f"  Successfully replaced label in {dst}.")
+            except Exception as e:
+                print(
+                    f"  Error during label replacement in {dst}: {e}",
+                    file=sys.stderr,
+                )
+            finally:
+                # Ensure the temporary file is removed if it still exists
+                if tmp_out.exists():
+                    try:
+                        tmp_out.unlink()
+                        print(f"  Cleaned up temporary file {tmp_out}")
+                    except OSError as unlink_err:
+                        print(
+                            f"  Warning: Could not remove temporary file {tmp_out}: {unlink_err}",
+                            file=sys.stderr,
+                        )
+        else:
+            # Delete label if no replacement text provided
+            try:
+                delete_associated_image(dst, "label")
+                print(f"  Removed label image from {dst}")
+            except Exception as e:
+                print(
+                    f"  Warning: Could not remove label image from {dst}: {e}",
+                    file=sys.stderr,
+                )
 
         macro_exists_in_source = False
         if rect_coords is not None:
@@ -338,6 +379,7 @@ def process_slide(
                     text=macro_text,
                     font_size=macro_font_size if macro_font_size is not None else 14,
                     font_color=font_color_rgb,
+                    logo_path=logo_path,
                 )
                 # Atomic replace original file
                 tmp_out.replace(dst)
@@ -569,6 +611,35 @@ def main(argv=None):
         default="white",
         help="Font color for the text on the macro image (e.g., 'white', '#FFFFFF'). Default: white.",
     )
+    p.add_argument(
+        "--label-text",
+        help="Text to replace the label image with (optional). If not provided, label will be deleted.",
+        default=None,
+    )
+    p.add_argument(
+        "--label-font-size",
+        type=int,
+        help="Font size for the text on the label image (optional, default: 14).",
+        default=14,
+    )
+    p.add_argument(
+        "--label-fill-color",
+        type=str,
+        default="white",
+        help="Fill color for the label background (e.g., 'white', '#FFFFFF'). Default: white.",
+    )
+    p.add_argument(
+        "--label-font-color",
+        type=str,
+        default="black",
+        help="Font color for the text on the label image (e.g., 'black', '#000000'). Default: black.",
+    )
+    p.add_argument(
+        "--logo-path",
+        type=str,
+        help="Path to logo image file to add to bottom left of macro and label images (optional).",
+        default=None,
+    )
     args = p.parse_args(argv)
 
     out_dir = Path(args.out)
@@ -688,6 +759,16 @@ def main(argv=None):
         except ValueError as e:
             print(f"Error parsing --font-color: {e}", file=sys.stderr)
             return
+        try:
+            parsed_label_fill_color = parse_color(args.label_fill_color)
+        except ValueError as e:
+            print(f"Error parsing --label-fill-color: {e}", file=sys.stderr)
+            return
+        try:
+            parsed_label_font_color = parse_color(args.label_font_color)
+        except ValueError as e:
+            print(f"Error parsing --label-font-color: {e}", file=sys.stderr)
+            return
 
         for path in sorted(list(all_paths)):
             print(f"Processing path: {path}")
@@ -714,6 +795,11 @@ def main(argv=None):
                     args.macro_font_size,
                     parsed_fill_color,
                     parsed_font_color,
+                    args.label_text,
+                    args.label_font_size,
+                    parsed_label_fill_color,
+                    parsed_label_font_color,
+                    args.logo_path,
                 )
                 print(f"✓ {path} → {out_dir}")
             except Exception as e:
