@@ -6,9 +6,16 @@ import argparse
 import os
 import sys
 
-import cv2
-import numpy as np
-from pyzbar import pyzbar
+try:
+    import cv2
+    import numpy as np
+    from pyzbar import pyzbar
+except Exception:
+    import pytest
+    pytest.skip(
+        "Required libraries for docker_test not available",
+        allow_module_level=True,
+    )
 
 def find_barcodes(image):
     """Finds all supported barcodes (QR codes, etc.) using pyzbar."""

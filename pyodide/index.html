@@ -1,0 +1,19 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <title>WSI Deidentifier (Pyodide)</title>
+  <script src="https://cdn.jsdelivr.net/pyodide/v0.25.1/full/pyodide.js"></script>
+</head>
+<body>
+  <h1>WSI Deidentifier (Pyodide)</h1>
+  <input type="file" id="slideFile" accept=".svs,.tif,.tiff" />
+  <br/>
+  <label>Salt (optional): <input type="text" id="saltInput"></label>
+  <br/>
+  <button id="runBtn">Deidentify</button>
+  <pre id="log"></pre>
+  <div id="downloads"></div>
+  <script type="module" src="main.js"></script>
+</body>
+</html>
