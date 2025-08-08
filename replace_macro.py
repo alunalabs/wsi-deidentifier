@@ -20,7 +20,6 @@ import struct
 import sys
 from io import BytesIO
 
-import openslide
 from PIL import Image, ImageColor, ImageDraw, ImageFile, ImageFont
 
 # allow Pillow to open incomplete JPEGs
@@ -193,7 +192,10 @@ def align(n: int, big: bool) -> int:
 
 
 def load_macro_openslide(path):
+    """Load the macro image using OpenSlide if possible."""
     try:
+        import openslide
+
         with openslide.OpenSlide(path) as slide:
             return slide.associated_images.get("macro", None)
     except Exception:  # structural corruption or vendor-specific corner cases
@@ -219,6 +221,38 @@ def load_macro_fallback(data, offsets, counts, w, h, cmp, endian):
         return img
 
     return None
+
+
+def load_macro(path, info):
+    """Load the macro image using openslide if available, otherwise fall back
+    to decoding directly from the TIFF data."""
+    try:
+        import openslide
+
+        with openslide.OpenSlide(path) as slide:
+            img = slide.associated_images.get("macro", None)
+            if img is not None:
+                return img
+    except Exception:
+        pass
+
+    macro = info.get("macro_entries")
+    if not macro:
+        return None
+
+    def entry(tag):
+        return next((e for e in macro if e.tag == tag), None)
+
+    off_entry = entry(TAG_STRIP_OFFSETS)
+    cnt_entry = entry(TAG_STRIP_BYTE_COUNTS)
+    if not off_entry or not cnt_entry:
+        return None
+
+    offsets = array_val(off_entry, info["data"], info["endian"])
+    counts = array_val(cnt_entry, info["data"], info["endian"])
+    return load_macro_fallback(
+        info["data"], offsets, counts, info["width"], info["height"], info["cmp"], info["endian"]
+    )
 
 
 def fail(msg, **ctx):
@@ -456,7 +490,7 @@ def replace_macro(
     h = info["height"]
 
     # Decode existing macro so we can paint the rectangle ---------------
-    img = load_macro_openslide(input_path)
+    img = load_macro(input_path, info)
     if img is None:
         fail("Unable to decode macro", compression=info["cmp"])
     img = img.convert("RGB")
